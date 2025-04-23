@@ -162,11 +162,7 @@ alet' lhs1 us (Alet lhs2 uniqueness a1 a2) a3
 alet' lhs@(LeftHandSideWildcard TupRunit) _ bnd a = case bnd of
   Compute _ -> a
   Return _  -> a
-  Alloc{}   -> a
-  Use{}     -> a
-  Unit _    -> a
   _ -> Alet lhs TupRunit bnd a -- 'bnd' may have side effects
-alet' lhs@(LeftHandSideWildcard TupRunit) _ bnd a = Alet lhs TupRunit bnd a
 alet' lhs _ (Return vars)      a = weaken (substituteLHS lhs vars) a
 alet' lhs us (Compute e)       a
   | Just vars <- extractParams e = weaken (substituteLHS lhs vars) a

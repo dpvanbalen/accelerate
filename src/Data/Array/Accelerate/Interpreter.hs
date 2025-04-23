@@ -45,6 +45,7 @@ module Data.Array.Accelerate.Interpreter (
   -- UniformScheduleFun
 ) where
 
+{-
 import Prelude                                                      hiding (take, (!!), sum, Either(..) )
 import qualified Prelude
 import Data.Array.Accelerate.AST.Partitioned
@@ -100,7 +101,6 @@ import Data.Array.Accelerate.Trafo.Operation.Substitution (alet, aletUnique, wea
 import Data.Map (Map)
 import System.IO.Unsafe (unsafePerformIO)
 
-{-
 data Interpreter
 instance Backend Interpreter where
   type Schedule Interpreter = UniformScheduleFun

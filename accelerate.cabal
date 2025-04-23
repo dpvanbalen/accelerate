@@ -624,6 +624,7 @@ library
         -Wall
         -Wcompat
         -Wmissed-specialisations
+        -Wno-incomplete-uni-patterns
         -- -Wredundant-constraints
         -freduction-depth=100
         -fspec-constr-count=50

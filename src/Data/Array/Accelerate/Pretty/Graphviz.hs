@@ -24,7 +24,7 @@
 module Data.Array.Accelerate.Pretty.Graphviz (
 
   Graph,
-  PrettyGraph(..), Detail(..),
+  PrettyGraph, Detail,
 
   graphDelayedAcc, graphDelayedAfun,
 

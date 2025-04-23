@@ -30,7 +30,6 @@ import Data.Maybe (fromJust,  mapMaybe )
 import Control.Monad.State
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.NameGeneration (freshName)
 import Data.Foldable
-import Data.Tuple (swap)
 
 data Objective
   = NumClusters
@@ -202,7 +201,7 @@ data ClusterLs = Execs (Labels Comp) | NonExec (Label Comp)
 -- and their bodies should all be in earlier clusters already.
 -- Simply make one cluster per let, before the cluster with execs.
 -- TODO: split the cluster of Execs into connected components
-splitExecs :: ([Labels Comp], M.Map (Label Comp) [Labels Comp]) -> M.Map (Label Comp) (Symbol op) -> ([ClusterLs], M.Map (Label Comp) [ClusterLs])
+splitExecs :: ([Labels Comp], M.Map (Label Comp) [Labels Comp]) -> M.Map (Label Comp) (Symbol op tp) -> ([ClusterLs], M.Map (Label Comp) [ClusterLs])
 splitExecs (xs, xM) constrM = (f xs, M.map f xM)
   where
     f :: [Labels Comp] -> [ClusterLs]

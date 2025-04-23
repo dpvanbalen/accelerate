@@ -17,10 +17,10 @@
 -- _Significantly_ speeds up compilation of this file, but at an obvious cost!
 -- Even in GHC 9.0.1, which has Lower Your Guards, these checks take some time (though no longer quite as long).
 -- Recommended to disable these options when working on this file, and restore them when you're done.
--- {-# OPTIONS_GHC
---   -Wno-overlapping-patterns
---   -Wno-incomplete-patterns
--- #-}
+{-# OPTIONS_GHC
+  -Wno-overlapping-patterns
+  -Wno-incomplete-patterns
+#-}
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE InstanceSigs #-}
@@ -33,7 +33,7 @@ import Data.Array.Accelerate.AST.Var
 import Data.Array.Accelerate.Representation.Type
 import Data.Array.Accelerate.Type ( scalarType )
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Graph hiding (readEdges, writeEdges, strictEdges, dataflowEdges, symbols, graph)
-import Data.Array.Accelerate.Trafo.Partitioning.ILP.Labels hiding (EnvLabelTupF)
+import Data.Array.Accelerate.Trafo.Partitioning.ILP.Labels
 import Data.Array.Accelerate.Analysis.Match
 import Data.Array.Accelerate.Error
 
@@ -41,14 +41,12 @@ import qualified Data.Map as M
 import qualified Data.Graph as G
 import qualified Data.Set as S
 import Data.Maybe (fromJust)
-import Data.Type.Equality ( type (:~:)(Refl) )
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Solve (ClusterLs (Execs, NonExec))
 import Data.Array.Accelerate.AST.Environment (weakenWithLHS)
 
 import Prelude hiding ( take )
-import Lens.Micro (_1)
 import Lens.Micro.Extras (view)
-import Data.Array.Accelerate.Representation.Array (ArrayR (ArrayR), ArraysR)
+import Data.Array.Accelerate.Representation.Array (ArrayR (ArrayR))
 import Data.Functor.Identity
 import qualified Data.Tree as T
 import Data.Array.Accelerate.Representation.Shape (shapeType)
@@ -86,11 +84,11 @@ map' !?? key = case map' M.!? key of
 -- (namely, what it was before fusion), via an GroundsR.
 -- Since fusion goes via an untyped ILP, during reconstruction we need to rebuild the program and temporarily
 -- fulfill this contract: if something goes wrong during fusion or at the caller, bad things happen.
-reconstruct :: forall op a. MakesILP op => GroundsR a -> Bool -> Graph -> [ClusterLs] -> M.Map (Label Comp) [ClusterLs] -> M.Map (Label Comp) (Symbol op) -> PreOpenAcc (Clustered op) () a
+reconstruct :: forall op a. MakesILP op => GroundsR a -> Bool -> Graph -> [ClusterLs] -> M.Map (Label Comp) [ClusterLs] -> M.Map (Label Comp) (Symbol op WithBackendInfo) -> PreOpenAcc (Clustered op) () a
 reconstruct repr a b c d e = case openReconstruct a EnvNil b c d e of
           Exists res -> expectType repr res
 
-reconstructF :: forall op a. MakesILP op => PreOpenAfun op () a -> Bool -> Graph -> [ClusterLs] -> M.Map (Label Comp) [ClusterLs] -> M.Map (Label Comp) (Symbol op)  -> PreOpenAfun (Clustered op) () a
+reconstructF :: forall op a. MakesILP op => PreOpenAfun op () a -> Bool -> Graph -> [ClusterLs] -> M.Map (Label Comp) [ClusterLs] -> M.Map (Label Comp) (Symbol op WithBackendInfo)  -> PreOpenAfun (Clustered op) () a
 reconstructF original a b c d e = case openReconstructF a EnvNil b c (Label 1 Nothing) d e of
           Exists res -> expectFunTypeEqual original res
 
@@ -103,7 +101,7 @@ foldC :: (Label Comp -> b -> b) -> b -> ClusterL -> b
 foldC f x (ExecL ls) = foldr f x ls
 foldC f x (NonExecL l) = f l x
 
-topSort :: forall op. MakesILP op => Bool -> Graph -> Labels Comp -> M.Map (Label Comp) (Symbol op) -> [ClusterL]
+topSort :: forall op. MakesILP op => Bool -> Graph -> Labels Comp -> M.Map (Label Comp) (Symbol op WithBackendInfo) -> [ClusterL]
 topSort _ _ (S.toList -> [l]) _ = [ExecL [l]]  -- If the cluster is empty.
 topSort singletons (Graph _ _ strictEdges dataflowEdges) cluster symbols =
   if singletons then concatMap (map (ExecL . pure)) topsorteds else map ExecL topsorteds
@@ -165,7 +163,7 @@ openReconstruct   :: MakesILP op
                   -> Graph
                   -> [ClusterLs]
                   -> M.Map (Label Comp) [ClusterLs]
-                  -> M.Map (Label Comp) (Symbol op)
+                  -> M.Map (Label Comp) (Symbol op WithBackendInfo)
                   -> Exists (PreOpenAcc (Clustered op) aenv)
 openReconstruct  a b c d   e f = (\(Left x) -> x) $ openReconstruct' a b c d Nothing e f
 openReconstructF  :: MakesILP op
@@ -175,11 +173,11 @@ openReconstructF  :: MakesILP op
                   -> [ClusterLs]
                   -> Label Comp
                   -> M.Map (Label Comp) [ClusterLs]
-                  -> M.Map (Label Comp) (Symbol op)
+                  -> M.Map (Label Comp) (Symbol op WithBackendInfo)
                   -> Exists (PreOpenAfun (Clustered op) aenv)
 openReconstructF a b c d l e f = (\(Right x) -> x) $ openReconstruct' a b c d (Just l) e f
 
-openReconstruct' :: forall op aenv. MakesILP op => Bool -> BuffersEnv aenv -> Graph -> [ClusterLs] -> Maybe (Label Comp) -> M.Map (Label Comp) [ClusterLs] -> M.Map (Label Comp) (Symbol op)  -> Either (Exists (PreOpenAcc (Clustered op) aenv)) (Exists (PreOpenAfun (Clustered op) aenv))
+openReconstruct' :: forall op aenv. MakesILP op => Bool -> BuffersEnv aenv -> Graph -> [ClusterLs] -> Maybe (Label Comp) -> M.Map (Label Comp) [ClusterLs] -> M.Map (Label Comp) (Symbol op WithBackendInfo)  -> Either (Exists (PreOpenAcc (Clustered op) aenv)) (Exists (PreOpenAfun (Clustered op) aenv))
 openReconstruct' singletons labelenv graph clusterslist mlab subclustersmap symbols =
   case mlab of
   Just l  -> Right $ makeASTF labelenv l mempty
@@ -199,7 +197,6 @@ openReconstruct' singletons labelenv graph clusterslist mlab subclustersmap symb
                             \c args' ->
                                 Exists $ Exec c (mapArgs (\(LOp a _ _) -> a) args')
       NotFold con -> case con of
-        SExe {}    -> error "should be Fold/InitFold!"
         SExe'{}    -> error "should be Fold/InitFold!"
         SUse se  n be             -> Exists $ Use se n be
         SITE env' c t f   -> case (makeAST env (subcluster t) prev, makeAST env (subcluster f) prev) of
@@ -303,7 +300,7 @@ weakenAcc lhs =  runIdentity . reindexAcc (weakenReindex $ weakenWithLHS lhs)
 data FoldType op env
   = forall args. Fold (Clustered op args) (LabelledArgsOp op env args)
   | forall args. InitFold (op args) (Label Comp) (LabelledArgsOp op env args)
-  | NotFold (Symbol op)
+  | NotFold (Symbol op WithBackendInfo)
 
 
 louttovar :: LabelledArgOp op env (Out sh e) -> LabelledArgOp op env (Var' sh)

@@ -112,7 +112,6 @@ import Data.Array.Accelerate.Sugar.Foreign
 import Data.Array.Accelerate.Sugar.Shape                            ( Shape(..), Slice(..), (:.) )
 import Data.Array.Accelerate.Type
 import qualified Data.Array.Accelerate.Representation.Array         as R
-import qualified Data.Array.Accelerate.Representation.Tag           as R
 
 import Data.Array.Accelerate.Classes.Eq
 import Data.Array.Accelerate.Classes.Fractional

@@ -26,9 +26,7 @@ import Data.Array.Accelerate.AST.Operation
 import Data.Array.Accelerate.Representation.Type
 
 import Lens.Micro
-import Lens.Micro.TH
 import Lens.Micro.Mtl
-import Lens.Micro.Extras
 
 import Data.Set (Set)
 import qualified Data.Set as S

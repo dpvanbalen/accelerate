@@ -11,7 +11,7 @@
 {-# LANGUAGE TypeOperators       #-}
 {-# LANGUAGE StandaloneDeriving       #-}
 {-# LANGUAGE ViewPatterns        #-}
-{-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# OPTIONS_GHC -fno-warn-orphans -fno-warn-name-shadowing -fno-warn-unused-top-binds #-} -- these warnings show up a ton in this file; we need to either ignore them consciously or fix them
 {-# LANGUAGE InstanceSigs #-}
 -- |
 -- Module      : Data.Array.Accelerate.Pretty.Operation
@@ -29,12 +29,9 @@ import Data.Array.Accelerate.Pretty.Exp hiding (Val(..), prj)
 import qualified Data.Array.Accelerate.Pretty.Exp as Pretty
 import Data.Array.Accelerate.Pretty.Type
 import Data.Array.Accelerate.Pretty.Operation
-import Data.Array.Accelerate.AST.Environment (Env)
-import qualified Data.Array.Accelerate.AST.Environment as Env
 import Data.Array.Accelerate.AST.Partitioned
 import Data.Array.Accelerate.AST.LeftHandSide
 import Data.Array.Accelerate.Type
-import Data.Array.Accelerate.Trafo.Operation.LiveVars
 import Data.Array.Accelerate.Error
 
 import Prettyprinter
@@ -43,8 +40,6 @@ import Prelude hiding (exp)
 import Data.Array.Accelerate.Representation.Type
 import Data.Array.Accelerate.Representation.Shape
 import Data.Array.Accelerate.Representation.Array
-import Data.Array.Accelerate.AST.Idx (Idx (..))
-import Data.Bifunctor (second)
 import Data.Array.Accelerate.AST.Var (varsType)
 
 instance (PrettyOp op, SetOpIndices op) => PrettyOp (Clustered op) where

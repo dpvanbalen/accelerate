@@ -50,7 +50,7 @@ import Data.Array.Accelerate.Trafo.Desugar (ArrayDescriptor(..))
 import Data.Array.Accelerate.Trafo.Operation.Simplify (SimplifyOperation(..))
 import Data.Array.Accelerate.Representation.Array (Array, Buffer, Buffers, ArrayR (..))
 import Data.Array.Accelerate.AST.LeftHandSide
-import Data.Array.Accelerate.Representation.Shape (ShapeR (..), shapeType, typeShape, rank)
+import Data.Array.Accelerate.Representation.Shape (ShapeR (..), shapeType, rank)
 import Data.Type.Equality
 import Unsafe.Coerce (unsafeCoerce)
 import Data.Array.Accelerate.Representation.Type

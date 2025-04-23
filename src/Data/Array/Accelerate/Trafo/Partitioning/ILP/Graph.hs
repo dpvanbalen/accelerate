@@ -52,10 +52,6 @@ import Data.Kind (Type)
 import Unsafe.Coerce (unsafeCoerce)
 import Data.Array.Accelerate.AST.Idx
 
--- Temoprarily added to make HLS work.
-data Edge where
-  (:->) :: forall a. a -> a -> Edge
-
 
 --------------------------------------------------------------------------------
 -- Graph
@@ -371,23 +367,23 @@ writeDir comp buff = var $ WriteDir (findParentIsAncestorC comp buff) buff
 --------------------------------------------------------------------------------
 -- Symbol table
 --------------------------------------------------------------------------------
-
-data Symbol (op :: Type -> Type) where
-  SExe  :: BuffersEnv env -> LabelledArgs      env args -> op args                              -> Symbol op
-  SExe' :: BuffersEnv env -> LabelledArgsOp op env args -> op args                              -> Symbol op
-  SUse  ::                   ScalarType e -> Int -> Buffer e                                    -> Symbol op
-  SITE  :: BuffersEnv env -> ExpVar env PrimBool -> Label Comp -> Label Comp                    -> Symbol op
-  SWhl  :: BuffersEnv env -> Label Comp -> Label Comp -> GroundVars env bnd -> Uniquenesses bnd -> Symbol op
-  SLet  ::                   BoundGLHS bnd env env' -> Label Comp           -> Uniquenesses bnd -> Symbol op
-  SFun  ::                   BoundGLHS bnd env env' -> Label Comp                               -> Symbol op
-  SBod  ::                   Label Comp                                                         -> Symbol op
-  SRet  :: BuffersEnv env -> GroundVars env a                                                   -> Symbol op
-  SCmp  :: BuffersEnv env -> Exp env a                                                          -> Symbol op
-  SAlc  :: BuffersEnv env -> ShapeR sh -> ScalarType e -> ExpVars env sh                        -> Symbol op
-  SUnt  :: BuffersEnv env -> ExpVar env e                                                       -> Symbol op
+data SymbolType = WithBackendInfo | WithoutBackendInfo
+data Symbol (op :: Type -> Type) (tp :: SymbolType) where
+  SExe  :: BuffersEnv env -> LabelledArgs      env args -> op args                              -> Symbol op WithoutBackendInfo
+  SExe' :: BuffersEnv env -> LabelledArgsOp op env args -> op args                              -> Symbol op WithBackendInfo
+  SUse  ::                   ScalarType e -> Int -> Buffer e                                    -> Symbol op tp
+  SITE  :: BuffersEnv env -> ExpVar env PrimBool -> Label Comp -> Label Comp                    -> Symbol op tp
+  SWhl  :: BuffersEnv env -> Label Comp -> Label Comp -> GroundVars env bnd -> Uniquenesses bnd -> Symbol op tp
+  SLet  ::                   BoundGLHS bnd env env' -> Label Comp           -> Uniquenesses bnd -> Symbol op tp
+  SFun  ::                   BoundGLHS bnd env env' -> Label Comp                               -> Symbol op tp
+  SBod  ::                   Label Comp                                                         -> Symbol op tp
+  SRet  :: BuffersEnv env -> GroundVars env a                                                   -> Symbol op tp
+  SCmp  :: BuffersEnv env -> Exp env a                                                          -> Symbol op tp
+  SAlc  :: BuffersEnv env -> ShapeR sh -> ScalarType e -> ExpVars env sh                        -> Symbol op tp
+  SUnt  :: BuffersEnv env -> ExpVar env e                                                       -> Symbol op tp
 
 -- | Mapping from labels to symbols.
-type Symbols op = Map (Label Comp) (Symbol op)
+type Symbols op tp = Map (Label Comp) (Symbol op tp)
 
 data LabelledArgOp  op env a = LOp (Arg env a) (ArgLabels a) (BackendArg op)
 type LabelledArgsOp op env   = PreArgs (LabelledArgOp op env)
@@ -409,11 +405,19 @@ reindexLabelledArgOp k (LOp (ArgArray m repr sh buffers) l o) = (\x -> LOp x l o
 reindexLabelledArgsOp :: Applicative f => ReindexPartial f env env' -> LabelledArgsOp op env t -> f (LabelledArgsOp op env' t)
 reindexLabelledArgsOp = reindexPreArgs reindexLabelledArgOp
 
-attachBackendLabels :: MakesILP op => Solution op -> Symbols op -> Symbols op
+attachBackendLabels :: MakesILP op => Solution op -> Symbols op WithoutBackendInfo -> Symbols op WithBackendInfo
 attachBackendLabels sol = M.mapWithKey \cases
   l (SExe lenv largs op) -> SExe' lenv (labelLabelledArgs sol l largs) op
-  _  SExe'{} -> error "already converted???"
-  _  con -> con
+  _  con@SUse{} -> unsafeCoerce con
+  _  con@SITE{} -> unsafeCoerce con
+  _  con@SWhl{} -> unsafeCoerce con
+  _  con@SLet{} -> unsafeCoerce con
+  _  con@SFun{} -> unsafeCoerce con
+  _  con@SBod{} -> unsafeCoerce con
+  _  con@SRet{} -> unsafeCoerce con
+  _  con@SCmp{} -> unsafeCoerce con
+  _  con@SAlc{} -> unsafeCoerce con
+  _  con@SUnt{} -> unsafeCoerce con
 
 
 
@@ -454,13 +458,13 @@ attachBackendLabels sol = M.mapWithKey \cases
 -- depending on which branch is taken.
 --
 data FullGraphState op env = FullGraphState
-  { _fusionILP  :: FusionILP op   -- ^ The ILP information.
-  , _buffersEnv :: BuffersEnv env  -- ^ The label environment.
-  , _readersEnv :: ReadersEnv     -- ^ Mapping from buffers to consumers.
-  , _writersEnv :: WritersEnv     -- ^ Mapping from buffers to producers.
-  , _symbols    :: Symbols op     -- ^ The symbols for the ILP.
-  , _currComp   :: Label Comp     -- ^ The current computation label.
-  , _currEnvL   :: EnvLabel       -- ^ The current environment label.
+  { _fusionILP  :: FusionILP op                   -- ^ The ILP information.
+  , _buffersEnv :: BuffersEnv env                 -- ^ The label environment.
+  , _readersEnv :: ReadersEnv                     -- ^ Mapping from buffers to consumers.
+  , _writersEnv :: WritersEnv                     -- ^ Mapping from buffers to producers.
+  , _symbols    :: Symbols op WithoutBackendInfo  -- ^ The symbols for the ILP.
+  , _currComp   :: Label Comp                     -- ^ The current computation label.
+  , _currEnvL   :: EnvLabel                       -- ^ The current environment label.
   }
 
 type ReadersEnv = Map (Label Buff) (Labels Comp)
@@ -598,13 +602,13 @@ freshBuff = do
 -- Graph construction
 --------------------------------------------------------------------------------
 
-mkFullGraph :: MakesILP op => PreOpenAcc op () a -> (FusionILP op, Symbols op)
+mkFullGraph :: MakesILP op => PreOpenAcc op () a -> (FusionILP op, Symbols op WithoutBackendInfo)
 mkFullGraph acc = (s^.fusionILP & constraints <>~ manifestRes, s^.symbols)
   where
     (res, s) = runState (mkFullGraph' acc) initialFullGraphState
     manifestRes = foldMap (foldMap (\b -> manifest b .==. int 0)) res
 
-mkFullGraphF :: MakesILP op => PreOpenAfun op () a -> (FusionILP op, Symbols op)
+mkFullGraphF :: MakesILP op => PreOpenAfun op () a -> (FusionILP op, Symbols op WithoutBackendInfo)
 mkFullGraphF acc = (s^.fusionILP, s^.symbols)
   where
     (_, s) = runState (mkFullGraphF' acc) initialFullGraphState

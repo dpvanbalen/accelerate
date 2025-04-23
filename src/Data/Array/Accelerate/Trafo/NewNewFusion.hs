@@ -35,12 +35,6 @@ import Data.Array.Accelerate.Error
 import Data.Array.Accelerate.Trafo.Partitioning.ILP
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Graph (MakesILP)
 import qualified Data.Array.Accelerate.Pretty.Operation as Pretty
-import Data.Array.Accelerate.Trafo.Partitioning.ILP.Solve (Objective (..))
-
-
-
-
-
 
 -- Array Fusion
 -- ============

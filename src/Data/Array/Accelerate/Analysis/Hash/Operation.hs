@@ -20,12 +20,8 @@
 module Data.Array.Accelerate.Analysis.Hash.Operation ( EncodeOperation(..), hashOperation, encodePreArgs, encodeArg ) where
 
 import Data.Array.Accelerate.Analysis.Hash.Exp
-import Data.Array.Accelerate.AST.Idx
-import Data.Array.Accelerate.AST.Var
 import Data.Array.Accelerate.AST.Partitioned
-import Data.Array.Accelerate.Trafo.LiveVars
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Graph (MakesILP, encodeBackendClusterArg)
-import Data.Array.Accelerate.Trafo.Operation.LiveVars
 
 import Crypto.Hash.XKCP
 import Data.ByteString.Builder

@@ -16,7 +16,7 @@ import Data.Array.Accelerate.AST.Partitioned
 import Data.Array.Accelerate.AST.Operation
     ( OperationAcc, OperationAfun )
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Solver
-    ( ILPSolver, solve, (.==.), int )
+    ( ILPSolver, solve )
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.MIP
     ( cbc, cplex, glpsol, gurobiCl, lpSolve, scip, MIP(..) )
 
@@ -25,10 +25,7 @@ import Data.Array.Accelerate.Trafo.Partitioning.ILP.Labels (Label, LabelType(..)
 import Data.Map (Map)
 import qualified Data.Array.Accelerate.Pretty.Operation as Pretty
 import Data.Function ((&))
-import qualified Data.Set as Set
-import Lens.Micro ((^.), (<>~))
-import Data.Maybe (isJust)
--- import Data.Array.Accelerate.Trafo.Partitioning.ILP.HiGHS
+import Lens.Micro ((^.))
 
 data Benchmarking = GreedyUp | GreedyDown | NoFusion
   deriving (Show, Eq, Bounded, Enum)
@@ -69,8 +66,8 @@ ilpFusionF :: (MakesILP op, ILPSolver s op, Pretty.PrettyOp (Cluster op)) => s -
 ilpFusionF solver objective fun = ilpFusion' mkFullGraphF (reconstructF fun False) solver objective fun
 
 ilpFusion' :: (MakesILP op, ILPSolver s op)
-           => (x -> (FusionILP op, Symbols op))
-           -> (Graph -> [ClusterLs] -> Map (Label Comp) [ClusterLs] -> Symbols op -> y)
+           => (x -> (FusionILP op, Symbols op WithoutBackendInfo))
+           -> (Graph -> [ClusterLs] -> Map (Label Comp) [ClusterLs] -> Symbols op WithBackendInfo -> y)
            -> s
            -> Objective
            -> x

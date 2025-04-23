@@ -48,7 +48,6 @@ module Data.Array.Accelerate.Array.Remote.Table (
 
 import Control.Concurrent                                           ( yield )
 import Control.Concurrent.MVar                                      ( MVar, newMVar, withMVar, mkWeakMVar )
--- import Control.Concurrent.Unique                                    ( Unique )
 import Control.Monad.IO.Class                                       ( MonadIO, liftIO )
 import Data.Functor
 import Data.Hashable                                                ( hash, Hashable )
@@ -64,12 +63,9 @@ import qualified Data.HashTable.IO                                  as HT
 
 import Data.Array.Accelerate.Error                              ( internalError )
 import Data.Array.Accelerate.Type
--- import Data.Array.Accelerate.Array.Unique                       ( UniqueArray(..) )
 import Data.Array.Accelerate.Array.Buffer
--- import Data.Array.Accelerate.Array.Data
 import Data.Array.Accelerate.Array.Remote.Class
 import Data.Array.Accelerate.Array.Remote.Nursery                   ( Nursery(..) )
-import Data.Array.Accelerate.Lifetime
 import qualified Data.Array.Accelerate.Array.Remote.Nursery         as N
 import qualified Data.Array.Accelerate.Debug.Internal.Flags         as Debug
 import qualified Data.Array.Accelerate.Debug.Internal.Profile       as Debug
