@@ -65,7 +65,7 @@ encodeCluster (SingleOp op label)
 encodeCluster (Fused fusion left right)
   = intHost $(hashQ "Fused") <> encodeFusion fusion <> encodeCluster left <> encodeCluster right
 
-encodeLabel :: Label -> Builder
+encodeLabel :: Label a -> Builder
 encodeLabel (Label idx Nothing) = intHost idx <> intHost $(hashQ "Nothing")
 encodeLabel (Label idx (Just l)) = intHost idx <> intHost $(hashQ "Just") <> encodeLabel l
 

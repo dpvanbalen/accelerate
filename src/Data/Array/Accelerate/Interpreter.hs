@@ -41,8 +41,8 @@
 --
 
 module Data.Array.Accelerate.Interpreter (
-  module Data.Array.Accelerate.Interpreter,
-  UniformScheduleFun
+  -- module Data.Array.Accelerate.Interpreter,
+  -- UniformScheduleFun
 ) where
 
 import Prelude                                                      hiding (take, (!!), sum, Either(..) )
@@ -73,7 +73,7 @@ import Unsafe.Coerce (unsafeCoerce)
 import Control.Monad.ST
 import Data.Bits
 import Data.Array.Accelerate.Backend
-import Data.Array.Accelerate.Trafo.Partitioning.ILP.Graph (Var (..), (-?>), fused, infusibleEdges, manifest, LabelledArgOp (LOp))
+import Data.Array.Accelerate.Trafo.Partitioning.ILP.Graph (Var (..), fused, infusibleEdges, manifest, LabelledArgOp (LOp))
 import qualified Data.Array.Accelerate.Trafo.Partitioning.ILP.Graph as Graph
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Labels
 import qualified Data.Set as Set
@@ -100,11 +100,11 @@ import Data.Array.Accelerate.Trafo.Operation.Substitution (alet, aletUnique, wea
 import Data.Map (Map)
 import System.IO.Unsafe (unsafePerformIO)
 
+{-
 data Interpreter
 instance Backend Interpreter where
   type Schedule Interpreter = UniformScheduleFun
   type Kernel Interpreter = InterpretKernel
-
 
 (!?!) :: (Ord a1, Show a1, Show a2) => Map a1 a2 -> a1 -> a2
 map !?! key = case map M.!? key of
@@ -1276,3 +1276,4 @@ evalMin :: SingleType a -> ((a, a) -> a)
 evalMin (NumSingleType (IntegralNumType ty)) | IntegralDict <- integralDict ty = uncurry min
 evalMin (NumSingleType (FloatingNumType ty)) | FloatingDict <- floatingDict ty = uncurry min
 
+-}

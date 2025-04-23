@@ -58,7 +58,7 @@ convertAccWith
     -> OperationAcc op () a
     -> PartitionedAcc op () a
 convertAccWith _ (Fusion o)       = withSimplStats (ilpFusion'' defaultSolver o)
-convertAccWith _ (Benchmarking b) = withSimplStats (bench b FusedEdges)
+-- convertAccWith _ (Benchmarking b) = withSimplStats (bench b FusedEdges)
 
 convertAcc :: (HasCallStack, MakesILP op, Pretty.PrettyOp (Cluster op)) => FusionType -> OperationAcc op () a -> PartitionedAcc op () a
 convertAcc = convertAccWith defaultOptions
@@ -70,7 +70,7 @@ convertAfun = convertAfunWith defaultOptions
 
 convertAfunWith :: (HasCallStack, MakesILP op, Pretty.PrettyOp (Cluster op)) => Config -> FusionType -> OperationAfun op () f -> PartitionedAfun op () f
 convertAfunWith _ (Fusion o)       = withSimplStats (ilpFusionF'' defaultSolver o)
-convertAfunWith _ (Benchmarking b) = withSimplStats (benchF b FusedEdges)
+-- convertAfunWith _ (Benchmarking b) = withSimplStats (benchF b FusedEdges)
 
 
 withSimplStats :: a -> a

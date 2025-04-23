@@ -87,7 +87,7 @@ ilpFusion' k1 k2 s obj acc = fusedAcc
     solve' x = unsafePerformIO (solve s x) & \case
       Nothing -> error "Accelerate: No ILP solution found"
       Just y -> y
-
+{-
 -- for benchmarking: make all edges infusible
 -- note: does allow for horizontal fusion!
 -- more rigorous is to change 'topSort' in Clustering.hs into separating each cluster completely
@@ -177,3 +177,4 @@ noFusion      :: (MakesILP op, ILPSolver s op, Pretty.PrettyOp (Cluster op)) => 
 noFusion      solver objective acc =     noFusion' mkFullGraph  (reconstruct (groundsR acc) True) solver objective acc
 noFusionF     :: (MakesILP op, ILPSolver s op, Pretty.PrettyOp (Cluster op)) => s -> Objective -> OperationAfun op () a -> PartitionedAfun op () a
 noFusionF     solver objective fun =     noFusion' mkFullGraphF (reconstructF fun True) solver objective fun
+-}
