@@ -51,6 +51,7 @@ import Lens.Micro
 import Lens.Micro.Mtl
 
 import Control.Monad.State.Strict (State, runState)
+import Data.Composition
 import Data.Foldable (Foldable (foldr'), traverse_, toList)
 import Data.Kind (Type)
 import Debug.Trace
@@ -450,24 +451,24 @@ labelLabelledArgs _ _ ArgsNil = ArgsNil
 
 data Var (op :: Type -> Type)
   -- Variables used by fusion:
-  = Pi (Node Comp)
+  = Pi (Node Comp) CopyId
     -- ^ Used for acyclic ordering of clusters.
     -- Pi (Node x y) = z means that computation number x (possibly a subcomputation of y, see Node) is fused into cluster z (y ~ Just i -> z is a subcluster of the cluster of i)
-  | Fused (Node Comp) (Node Comp)
+  | Fused (Node Comp) (Node Comp) CopyId
     -- ^ 0 is fused (same cluster), 1 is unfused. We do *not* have one of these for all pairs, only the ones we need for constraints and/or costs!
     -- Invariant: Like edges, both labels have to have the same parent: Either on top (Node _ Nothing) or as sub-computation of the same label (Node _ (Just x)).
     -- In fact, this is the Var-equivalent to Edge: an infusible edge has a constraint (== 1).
   | Manifest (Node GVal)
     -- ^ 0 means manifest, 1 is like a `delayed array`.
     -- Binary variable; will we write the output to a manifest array, or is it fused away (i.e. all uses are in its cluster)?
-  | ReadDir (Node GVal) (Node Comp)
+  | ReadDir (Node GVal) (Node Comp) CopyId
     -- ^ \-3 can't fuse with anything, -2 for 'left to right', -1 for 'right to left', n for 'unknown', see computation n (currently only backpermute).
   | WriteDir (Node Comp) (Node GVal)
     -- ^ See 'ReadDir'.
-  | InFoldSize (Node Comp)  -- Legacy? Probably needs per-edge equivalent
+  | InFoldSize (Node Comp) CopyId  -- Legacy? Probably needs per-edge equivalent
     -- ^ Keeps track of the fold that's one dimension larger than this operation, and is fused in the same cluster.
     -- This prevents something like @zipWith f (fold g xs) (fold g ys)@ from illegally fusing
-  | OutFoldSize (Node Comp)  -- Legacy? Probably needs per-edge equivalent
+  | OutFoldSize (Node Comp) CopyId  -- Legacy? Probably needs per-edge equivalent
     -- ^ Keeps track of the fold that's one dimension larger than this operation, and is fused in the same cluster.
     -- This prevents something like @zipWith f (fold g xs) (fold g ys)@ from illegally fusing
   | Other String
@@ -476,26 +477,33 @@ data Var (op :: Type -> Type)
     -- We currently use this in Solve.hs for cost functions.
   | BackendSpecific (BackendVar op)
     -- ^ Vars needed to express backend-specific fusion rules.
-    -- This is what allows backends to specify how each of the operations can fuse.
 
   -- Variables introduced for in-place updates:
   | InPlace (Node GVal) (Node Comp) (Node Comp) (Node GVal)
-    -- ^ 0 means in-place, 1 means not in-place. The first label is an input of a cluster, the second label is an output of a cluster.
+    -- ^ 0 means in-place, 1 means not in-place. The first label is an input of a cluster, the fourth label is an output of a cluster.
     -- All 'InPlace' variables need to be unique, so we can't omit the computation labels. Taking one path through a cluster is different from taking another.
   | PiMax (Node GVal)
     -- ^ The cluster number of the largest reader of the buffer, since in-place updates are only allowed on the final consumer of an array/buffer.
   -- | WriteDirPiMax (Node GVal)
   --   -- ^ The write direction of the largest reader of the buffer. This is used to check that all reads of the buffer are in the same direction as the write.
 
+  -- WIP: work duplication
+  | Copies (Node Comp)
+  -- ^ Number of times this computation is duplicated: 0 for no duplication, 1 more for each 'copy'
+  | ReadCopy (Node Comp) CopyId (Node GVal) (Node Comp) CopyId
+  -- ^ Is copy $5 of computation $4 reading from the version of array $3 that copy $2 of computation $1 makes?
+
+type CopyId = Int
+
 deriving instance Eq   (BackendVar op) => Eq   (Var op)
 deriving instance Ord  (BackendVar op) => Ord  (Var op)
 deriving instance Show (BackendVar op) => Show (Var op)
 
 -- | Constructor for 'Pi' variables.
-pi :: Node Comp -> Expression op
-pi = var . Pi
+pi :: Node Comp -> CopyId -> Expression op
+pi = var .* Pi
 
--- | No clue what this is for.
+-- | Opposite of manifest
 delayed :: MakesILP op => Node GVal -> Expression op
 delayed = notB . manifest
 
@@ -504,16 +512,16 @@ manifest :: Node GVal -> Expression op
 manifest = var . Manifest
 
 -- | Safe constructor for 'Fused' variables.
-fused :: (Node Comp, Node Comp) -> Expression op
-fused = var . uncurry Fused
+fused :: (Node Comp, Node Comp) -> CopyId -> Expression op
+fused = var .* uncurry Fused
 
 -- | Safe constructor for 'ReadDir' variables.
-readDir :: ReadEdge -> Expression op
-readDir = var . uncurry ReadDir
+readDir :: ReadEdge -> CopyId -> Expression op
+readDir = var .* uncurry ReadDir
 
 -- | Convert a foldable structure of 'ReadEdge' to a list of 'Expression's.
-readDirs :: Foldable f => f ReadEdge -> [Expression op]
-readDirs = map readDir . toList
+readDirs :: Foldable f => f (ReadEdge, CopyId) -> [Expression op]
+readDirs = map (uncurry readDir) . toList
 
 -- | Safe constructor for 'WriteDir' variables.
 writeDir :: WriteEdge -> Expression op
@@ -531,6 +539,11 @@ inplace ((b1,c1),(c2,b2)) = var $ InPlace b1 c1 c2 b2
 pimax :: Node GVal -> Expression op
 pimax = var . PiMax
 
+copies :: Node Comp -> Expression op
+copies = var . Copies
+
+readCopy :: Node Comp -> CopyId -> Node GVal -> Node Comp -> CopyId -> Expression op
+readCopy = var .**** ReadCopy
 
 
 --------------------------------------------------------------------------------

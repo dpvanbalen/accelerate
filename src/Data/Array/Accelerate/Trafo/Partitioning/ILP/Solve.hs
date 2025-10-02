@@ -102,7 +102,8 @@ makeILP obj (FusionILP graph constraints bounds) =
     -- objective function that maximises the number of edges we fuse, and minimises the number of array reads if you ignore horizontal fusion
     -- numberOfUnfusedEdges = M.foldMapWithKey (\e v -> const v `times` fused e)
     --                      $ foldl (flip \(i,_,j) -> M.insertWith (+) (i,j) 1) M.empty dataflowE
-    numberOfUnfusedEdges = foldMap fused fusibleE'
+    numberOfUnfusedEdges :: Expression op
+    numberOfUnfusedEdges = foldMap (($0) . fused) fusibleE'
 
     -- A cost function that doesn't ignore horizontal fusion.
     -- Idea: Each node $x$ with $n$ outgoing edges gets $n$ extra variables.
@@ -123,8 +124,8 @@ makeILP obj (FusionILP graph constraints bounds) =
       (subConstraint, subBounds) <- flip foldMapM consumers $ \(buff,cons) -> do
         useVars <- replicateM nConsumers useVar -- these are the n^2 variables: For each consumer, n variables which each check the equality of pi to readpi
         let constraint = foldMap
-              (\(uv, rp, ro) -> isEqualRangeN (var rp) (pi cons)              (var uv)
-                             <> isEqualRangeN (var ro) (readDir (buff, cons)) (var uv))
+              (\(uv, rp, ro) -> isEqualRangeN (var rp) (pi cons 0)            (var uv)
+                             <> isEqualRangeN (var ro) (readDir (buff, cons) 0) (var uv))
               (zip3 useVars readPis readOrders)
         return (constraint <> foldl (.+.) (int 0) (map var useVars) .<=. int (nConsumers-1), foldMap binary useVars)
       readPi0s <- replicateM nConsumers readPi0Var
@@ -154,43 +155,43 @@ makeILP obj (FusionILP graph constraints bounds) =
     numberOfClusters  = var (Other "maximumClusterNumber")
     -- removing this from myConstraints makes the ILP slightly smaller, but disables the use of this cost function
     numberOfClustersC = case obj of
-      NumClusters -> foldMap (\l -> pi l .<=. numberOfClusters) compN
-      Everything  -> foldMap (\l -> pi l .<=. numberOfClusters) compN
+      NumClusters -> foldMap (\l -> pi l 0 .<=. numberOfClusters) compN
+      Everything  -> foldMap (\l -> pi l 0 .<=. numberOfClusters) compN
       _ -> mempty
 
     fusionConstraints = fusibleAcyclicC <> strictAcyclicC <> infusibleC <> manifestC
       <> numberOfClustersC <> readC <> fusionOrderC <> finalize graph
 
     -- x_ij <= pi_j - pi_i <= n*x_ij for all fusible edges
-    fusibleAcyclicC = foldMap (\e@(i,j) -> between (fused e) (pi j .-. pi i) (timesN $ fused e)) fusibleE'
+    fusibleAcyclicC = foldMap (\e@(i,j) -> between (fused e 0) (pi j 0 .-. pi i 0) (timesN $ fused e 0)) fusibleE'
 
     -- pi_i < pi_j for all strict edges  NEW!
-    strictAcyclicC = foldMap (\(i,j) -> pi i .<. pi j) strictE
+    strictAcyclicC = foldMap (\(i,j) -> pi i 0 .<. pi j 0) strictE
 
     -- x_ij == 1 for all infusible edges
-    infusibleC = foldMap (\e -> fused e .==. int 1) infusibleE'
+    infusibleC = foldMap (\e -> fused e 0 .==. int 1) infusibleE'
 
     -- if (i,b,j) is not fused, b has to be manifest
     -- TODO: final output is also manifest
     -- manifestC = foldMap (\(i,b,j) -> notB (fused i j) `impliesB` manifest b) dataflowE
 
     -- forall b, iff all (w,b,r) are fused, then b is not manifest.
-    manifestC = M.foldMapWithKey (\b es -> allB (map fused es) (notB $ manifest b))
+    manifestC = M.foldMapWithKey (\b es -> allB (map (($0) . fused) es) (notB $ manifest b))
               $ foldl (flip \(i,b,j) -> M.insertWith (<>) b [(i,j)]) M.empty dataflowE
 
     -- if (w,b,r) is fused, then d_wb == d_br
     fusionOrderC = flip foldMap fusibleE $ \(w,b,r) ->
-                  timesN (fused (w,r)) .>=. readDir (b,r) .-. writeDir (w,b)
-      <> (-1) .*. timesN (fused (w,r)) .<=. readDir (b,r) .-. writeDir (w,b)
+                  timesN (fused (w,r) 0) .>=. readDir (b,r) 0 .-. writeDir (w,b)
+      <> (-1) .*. timesN (fused (w,r) 0) .<=. readDir (b,r) 0 .-. writeDir (w,b)
 
     fusionBounds :: Bounds op
     fusionBounds = piB <> fusedB <> manifestB <> readB
 
     --  0 <= pi_i <= n
-    piB = foldMap (\i -> lowerUpper 0 (Pi i) n) compN
+    piB = foldMap (\i -> lowerUpper 0 (Pi i 0) n) compN
 
     -- 0 <= x_ij <= 1
-    fusedB = foldMap (binary . uncurry Fused) $ S.map (\(i,_,j) -> (i,j)) dataflowE
+    fusedB = foldMap (binary . ($0) . uncurry Fused) $ S.map (\(i,_,j) -> (i,j)) dataflowE
 
     -- 0 <= m_i  <= 1
     manifestB = foldMap (binary . Manifest) buffN
@@ -214,7 +215,7 @@ makeILP obj (FusionILP graph constraints bounds) =
     acrossClusterC = flip foldMap inplaceP \case
       p@((_,c1),(c2,_))
         | c1 == c2  -> mempty
-        | otherwise -> isEqualRangeN (pi c1) (pi c2) (inplace p)
+        | otherwise -> isEqualRangeN (pi c1 0) (pi c2 0) (inplace p)
 
     -- If inplace p, then manifest b1 and manifest b2
     onManifestC = foldMap (\p@((b1,_),(_,b2)) -> (inplace p `impliesB` manifest b1) <> (inplace p `impliesB` manifest b2)) inplaceP
@@ -224,12 +225,12 @@ makeILP obj (FusionILP graph constraints bounds) =
     singleWriteC = foldMap (packB 1) $ foldl (flip \p@(_,(_,b)) -> M.insertWith (<>) b [inplace p]) M.empty inplaceP
 
     -- If inplace p, then pimax b1 >= pi c2
-    inplaceClusterC = foldMap (\p@((b1,_),(c2,_)) -> (pimax b1 .-. pi c2) .<=. timesN (inplace p)) inplaceP
+    inplaceClusterC = foldMap (\p@((b1,_),(c2,_)) -> (pimax b1 .-. pi c2 0) .<=. timesN (inplace p)) inplaceP
 
     -- Iff     inplace p, then pi c1     <= pimax b1
     -- Iff not inplace p, then pi c1 + 1 <= pimax b1
     -- finalClusterC = foldMap (\p@((b1,c1),_) -> pi c1 .+. inplace p .<=. pimax b1) inplaceP
-    finalClusterC = foldMap (\r@(b1,c1) -> pi c1 .+. int 1 .-. foldMap (\w -> int 1 .-. inplace (r,w)) (M.findWithDefault [] r readM) .<=. pimax b1) readE
+    finalClusterC = foldMap (\r@(b1,c1) -> pi c1 0 .+. int 1 .-. foldMap (\w -> int 1 .-. inplace (r,w)) (M.findWithDefault [] r readM) .<=. pimax b1) readE
 
     -- Group inplace paths by read edge:
     readM = foldl (flip \(r,w) -> M.insertWith (<>) r [w]) M.empty inplaceP
@@ -240,7 +241,7 @@ makeILP obj (FusionILP graph constraints bounds) =
     -- However, a mutable computation would create a third writer, which would be a problem.
 
     -- If inplace p, then d_br == d_wb
-    inplaceOrderC = foldMap (\p@(r,w) -> isEqualRangeN (readDir r) (writeDir w) (inplace p)) inplaceP
+    inplaceOrderC = foldMap (\p@(r,w) -> isEqualRangeN (readDir r 0) (writeDir w) (inplace p)) inplaceP
 
     inplaceConstraints = acrossClusterC <> onManifestC <> singleReadC <> singleWriteC <> inplaceClusterC <> finalClusterC <> inplaceOrderC
 
@@ -287,7 +288,7 @@ interpretReadDirs :: forall op. Solution op -> M.Map ReadEdge Int
 interpretReadDirs = M.fromList . mapMaybe (_1 fromReadDir) . M.toList
   where
     fromReadDir :: Var op -> Maybe ReadEdge
-    fromReadDir (ReadDir b c) = Just (b, c)
+    fromReadDir (ReadDir b c 0) = Just (b, c)
     fromReadDir _             = Nothing
 
 -- | Extract the write directions from the ILP solution.
@@ -312,7 +313,7 @@ interpretClusters sol = do
   (topClusters, subScopedClustersM)
   where
     fromPi :: Var op -> Maybe (Node Comp)
-    fromPi (Pi l) = Just l
+    fromPi (Pi l _) = Just l
     fromPi _      = Nothing
 
     scopeLabel :: [Nodes Comp] -> Node Comp
