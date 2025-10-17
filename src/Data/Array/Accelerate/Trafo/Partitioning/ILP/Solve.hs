@@ -171,10 +171,6 @@ makeILP obj (FusionILP graph constraints bounds) =
     -- x_ij == 1 for all infusible edges
     infusibleC = foldMap (\e -> fused e 0 .==. int 1) infusibleE'
 
-    -- if (i,b,j) is not fused, b has to be manifest
-    -- TODO: final output is also manifest
-    -- manifestC = foldMap (\(i,b,j) -> notB (fused i j) `impliesB` manifest b) dataflowE
-
     -- forall b, iff all (w,b,r) are fused, then b is not manifest.
     manifestC = M.foldMapWithKey (\b es -> allB (map (($0) . fused) es) (notB $ manifest b))
               $ foldl (flip \(i,b,j) -> M.insertWith (<>) b [(i,j)]) M.empty dataflowE
@@ -194,7 +190,7 @@ makeILP obj (FusionILP graph constraints bounds) =
     fusedB = foldMap (binary . ($0) . uncurry Fused) $ S.map (\(i,_,j) -> (i,j)) dataflowE
 
     -- 0 <= m_i  <= 1
-    manifestB = foldMap (binary . Manifest) buffN
+    manifestB = foldMap (binary . IsManifest) buffN
 
 
     ----------------------------------------------------------------------------

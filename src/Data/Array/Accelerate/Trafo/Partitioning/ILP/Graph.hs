@@ -458,7 +458,7 @@ data Var (op :: Type -> Type)
     -- ^ 0 is fused (same cluster), 1 is unfused. We do *not* have one of these for all pairs, only the ones we need for constraints and/or costs!
     -- Invariant: Like edges, both labels have to have the same parent: Either on top (Node _ Nothing) or as sub-computation of the same label (Node _ (Just x)).
     -- In fact, this is the Var-equivalent to Edge: an infusible edge has a constraint (== 1).
-  | Manifest (Node GVal)
+  | IsManifest (Node GVal)
     -- ^ 0 means manifest, 1 is like a `delayed array`.
     -- Binary variable; will we write the output to a manifest array, or is it fused away (i.e. all uses are in its cluster)?
   | ReadDir (Node GVal) (Node Comp) CopyId
@@ -507,9 +507,9 @@ pi = var .* Pi
 delayed :: MakesILP op => Node GVal -> Expression op
 delayed = notB . manifest
 
--- | Constructor for 'Manifest' variables.
+-- | Constructor for 'IsManifest' variables.
 manifest :: Node GVal -> Expression op
-manifest = var . Manifest
+manifest = var . IsManifest
 
 -- | Safe constructor for 'Fused' variables.
 fused :: (Node Comp, Node Comp) -> CopyId -> Expression op
@@ -964,6 +964,14 @@ mkFusionGraph (Return vars) = do
   symbol retN ?= SRet env vars
   return bs
 
+mkFusionGraph (Manifest buff) = do
+  env  <- use environment
+  retN <- freshComp
+  let (_, bs, _) = lookupVar buff env
+  retN `returnsBuffers` valsNodes bs
+  symbol retN ?= SRet env (TupRsingle buff)
+  return bs
+
 mkFusionGraph (Compute expr) = do
   c    <- freshComp
   env  <- use environment
@@ -1193,12 +1201,19 @@ mkInplacePathsFromClusters g = g&fusionILP.inplacePaths <>~ go initialClusters
 mkReindexPartial :: forall env env'. Map (Node GVal) (Node GVal) -> Env env -> Env env' -> ReindexPartial Maybe env env'
 mkReindexPartial m env env' idx = let node = lookupIdx idx env^._2 in case idxOf (inplaceOf node) env' of
     Just idx' -> Just idx'
-    -- Gracefully fall back to using the original value instead of the one defined by an in-place update.
+    -- Note: we are not yet sure what happens if the variable after in-place updates is not found,
+    -- but the variable before in-place updates is found. It might be that this never occurs.
+    -- Currently we throw an error in this case.
+    -- Instead, we could gracefully fall back to using the original value instead of the one defined by an in-place update.
     -- This is a bit unsafe, because there is no guarantee anything has been written to this value, or even that it exists at all.
-    -- That said, I think this can only happen when a value is returned, thus causing both the original value and the in-place updated value to be out-of-scope.
+    -- That said, I (Timo) think this can only happen when a value is returned, thus causing both the original value and the in-place updated value to be out-of-scope.
     -- The returned value is then stored in another scope, so if the return statement properly replaces the original value with the in-place updated value, then the resulting program should bind the in-place updated value instead of the original.
-    -- WARNING: No guarantee that this will always work, check if there are any issues.
-    Nothing -> internalWarning "mkReindexPartial: Fallback to non-in-place value." False $ idxOf node env'
+    -- See https://github.com/ivogabe/accelerate/pull/11#discussion_r2424009960
+    Nothing
+      | inplaceOf node /= node
+      , Just _ <- (idxOf node env') ->
+        internalError $ "mkReindexPartial: index of in-place updated buffer not found. Original buffer (without in-place updates taken into account) is available, but using that might not be sound."
+      | otherwise -> Nothing
   where
     -- Replace the buffer with the one we will actually write the data to.
     inplaceOf :: GroundVals a -> GroundVals a
