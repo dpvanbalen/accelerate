@@ -80,7 +80,7 @@ ilpFusion' :: (MakesILP op, SimplifyOperation op, ILPSolver s op)
            -> x
            -> y
 ilpFusion' toGraph fromGraph s obj acc = do
-  let fullgraph = {- traceGraph $ -} toGraph acc
+  let fullgraph = traceGraph $ toGraph acc
   let ilp       = makeILP obj (fullgraph^.fusionILP)
   let solution  = {- traceWith ppNumInplace $ -} fromMaybe (error "Accelerate: No ILP solution found") (unsafePerformIO $ solve s ilp)
   let symbols'  = attachBackendLabels solution (fullgraph^.symbols)

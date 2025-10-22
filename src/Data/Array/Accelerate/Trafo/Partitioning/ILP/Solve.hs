@@ -94,6 +94,8 @@ makeILP obj (FusionILP graph constraints bounds) =
     m :: Int
     m = S.size buffN
 
+    maxcopies :: Node a -> Int
+    maxcopies = const 3
 
     ----------------------------------------------------------------------------
     -- Fusion:
@@ -155,15 +157,17 @@ makeILP obj (FusionILP graph constraints bounds) =
     numberOfClusters  = var (Other "maximumClusterNumber")
     -- removing this from myConstraints makes the ILP slightly smaller, but disables the use of this cost function
     numberOfClustersC = case obj of
-      NumClusters -> foldMap (\l -> pi l 0 .<=. numberOfClusters) compN
-      Everything  -> foldMap (\l -> pi l 0 .<=. numberOfClusters) compN
+      NumClusters -> foldMap (\l -> foldMap (\i -> pi l i .<=. numberOfClusters) [0 .. maxcopies l]) compN
+      Everything  -> foldMap (\l -> foldMap (\i -> pi l i .<=. numberOfClusters) [0 .. maxcopies l]) compN
       _ -> mempty
 
     fusionConstraints = fusibleAcyclicC <> strictAcyclicC <> infusibleC <> manifestC
       <> numberOfClustersC <> readC <> fusionOrderC <> finalize graph
 
     -- x_ij <= pi_j - pi_i <= n*x_ij for all fusible edges
-    fusibleAcyclicC = foldMap (\e@(i,j) -> between (fused e 0) (pi j 0 .-. pi i 0) (timesN $ fused e 0)) fusibleE'
+    -- this constraint only needs to hold if readcopy i k j l == 0, i.e. between the copies of i and j that read from each other
+    -- otherwise, the pi's are allowed to differ by n in either direction
+    fusibleAcyclicC = foldMap (\e@(i,j) -> foldMap (\(k,l) -> between (fused e l .-. timesN (readCopy i k j l)) (pi j l .-. pi i k) (timesN (fused e l) .+. timesN (readCopy i k j l))) [(k,l) | k <- [0..maxcopies i], l <- [0..maxcopies j]]) fusibleE'
 
     -- pi_i < pi_j for all strict edges  NEW!
     strictAcyclicC = foldMap (\(i,j) -> pi i 0 .<. pi j 0) strictE

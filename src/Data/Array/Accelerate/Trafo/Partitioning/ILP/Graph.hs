@@ -457,7 +457,8 @@ data Var (op :: Type -> Type)
   | Fused (Node Comp) (Node Comp) CopyId
     -- ^ 0 is fused (same cluster), 1 is unfused. We do *not* have one of these for all pairs, only the ones we need for constraints and/or costs!
     -- Invariant: Like edges, both labels have to have the same parent: Either on top (Node _ Nothing) or as sub-computation of the same label (Node _ (Just x)).
-    -- In fact, this is the Var-equivalent to Edge: an infusible edge has a constraint (== 1).
+    -- In fact, this is the Var-equivalent to Edge: an infusible edge has a constraint (== 1), and a fused variable implies a read dependency of $2 on $1.
+    -- The CopyId belongs to the reader.
   | IsManifest (Node GVal)
     -- ^ 0 means manifest, 1 is like a `delayed array`.
     -- Binary variable; will we write the output to a manifest array, or is it fused away (i.e. all uses are in its cluster)?
@@ -490,8 +491,9 @@ data Var (op :: Type -> Type)
   -- WIP: work duplication
   | Copies (Node Comp)
   -- ^ Number of times this computation is duplicated: 0 for no duplication, 1 more for each 'copy'
-  | ReadCopy (Node Comp) CopyId (Node GVal) (Node Comp) CopyId
+  | ReadCopy (Node Comp) CopyId {-(Node GVal)-} (Node Comp) CopyId
   -- ^ Is copy $5 of computation $4 reading from the version of array $3 that copy $2 of computation $1 makes?
+  -- 0 yes, 1 no
 
 type CopyId = Int
 
@@ -542,8 +544,8 @@ pimax = var . PiMax
 copies :: Node Comp -> Expression op
 copies = var . Copies
 
-readCopy :: Node Comp -> CopyId -> Node GVal -> Node Comp -> CopyId -> Expression op
-readCopy = var .**** ReadCopy
+readCopy :: Node Comp -> CopyId -> {-Node GVal ->-} Node Comp -> CopyId -> Expression op
+readCopy = var .*** ReadCopy
 
 
 --------------------------------------------------------------------------------
