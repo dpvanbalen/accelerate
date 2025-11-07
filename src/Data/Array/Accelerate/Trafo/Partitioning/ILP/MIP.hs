@@ -36,11 +36,16 @@ import Control.Monad.Reader ( Reader, asks, runReader )
 import Data.String (fromString)
 import Data.Text (unpack)
 
+import Debug.Trace (traceShowId)
+
+debugging = True
+
+
 newtype MIP s = MIP s
 
 instance (MakesILP op, MIP.IsSolver s IO) => ILPSolver (MIP s) op where
   solvePartial :: MIP s -> ILP op -> IO (Maybe (Solution op))
-  solvePartial (MIP s) ilp@(ILP dir obj constr bnds n) = makeSolution names <$> MIP.solve s options problem
+  solvePartial (MIP s) ilp@(ILP dir obj constr bnds n) = ((if debugging then traceShowId else id) . makeSolution names) <$> MIP.solve s options problem
     where
       options = def { MIP.solveTimeLimit   = Nothing --Just 60
                     -- , MIP.solveLogger      = putStrLn . ("AccILPSolver: "      ++)
