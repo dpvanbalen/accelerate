@@ -60,6 +60,7 @@ import Data.String (fromString)
 data Comp  -- ^ The type of computation nodes.
 data GVal  -- ^ The type of ground value nodes.
 
+type CopyId = Int
 
 -- | Nodes for referencing nodes.
 data Node t where
@@ -291,12 +292,19 @@ freshE' = id <%= (+1)
 
 -- | An environment value consists of a unique 'EnvLabel', the stored 'GroundVals'
 --   and the 'Uniquenesses' of the stored values.
-type EnvVal t = (EnvLabel, GroundVals t, Uniquenesses t)
+type EnvVal t = (EnvLabel, GroundVals t, Uniquenesses t, CopyId)
 
 
 -- | A collection of multiple 'EnvVal's. Individual elements can be accessed by
 --   pattern matching on 'EnvLabels'.
-type EnvVals t = (EnvLabels t, GroundVals t, Uniquenesses t)
+type EnvVals t = (EnvLabels t, GroundVals t, Uniquenesses t, TupR (C.Const CopyId) t)
+
+
+copyEnvVal :: EnvVal t -> CopyId -> EnvVal t
+copyEnvVal (x,y,z,_) c = (x,y,z,c)
+
+copyEnvVals :: EnvVals t -> CopyId -> EnvVals t
+copyEnvVals (x,y,z,cs) c = (x,y,z,mapTupR (const $ C.Const c) cs)
 
 
 -- | The environment used during graph construction.
@@ -318,19 +326,19 @@ instance Show (Env env) where
 -- | Constructs a new 'Env' by prepending labels for each element in the left-hand side.
 weakenEnv :: LeftHandSide s v env env' -> GroundVals v -> Uniquenesses v -> Env env -> State EnvLabel (Env env')
 weakenEnv LeftHandSideWildcard{} _ _ = pure
-weakenEnv LeftHandSideSingle{} bs us = \lenv -> freshE' >>= \e -> return ((e, bs, us) :>>: lenv)
+weakenEnv LeftHandSideSingle{} bs us = \lenv -> freshE' >>= \e -> return ((e, bs, us, 0) :>>: lenv)
 weakenEnv (LeftHandSidePair l r) (TupRpair lbs rbs) (TupRpair lus rus) = weakenEnv l lbs lus >=> weakenEnv r rbs rus
 weakenEnv (LeftHandSidePair _ _) _ _ = internalError "mismatching left-hand side"
 
 
 -- | Look up 'Vars' in 'Env', returing 'EnvVals'.
 lookupVars :: Vars a env b -> Env env -> EnvVals b
-lookupVars TupRunit         _   = (TupRunit, TupRunit, TupRunit)
-lookupVars (TupRsingle var) env | (e, bs, u) <- lookupVar var env
-                                    = (TupRsingle (C.Const e), bs, u)
-lookupVars (TupRpair l r)   env | (el, bsl, ul) <- lookupVars l env
-                                    , (er, bsr, ur) <- lookupVars r env
-                                    = (TupRpair el er, TupRpair bsl bsr, TupRpair ul ur)
+lookupVars TupRunit         _   = (TupRunit, TupRunit, TupRunit, TupRunit)
+lookupVars (TupRsingle var) env | (e, bs, u, c) <- lookupVar var env
+                                    = (TupRsingle (C.Const e), bs, u, TupRsingle (C.Const c))
+lookupVars (TupRpair l r)   env | (el, bsl, ul, cl) <- lookupVars l env
+                                    , (er, bsr, ur, cr) <- lookupVars r env
+                                    = (TupRpair el er, TupRpair bsl bsr, TupRpair ul ur, TupRpair cl cr)
 
 
 -- | Look up a 'Var' in 'Env', returning an 'EnvVal'.
@@ -408,11 +416,23 @@ createLHS (BoundLHSpair l r)    env k =
     createLHS r env' $ \env'' r' ->
       k env'' (LeftHandSidePair l' r')
 
+copyLHS :: BoundLHS s v env env'
+        -> CopyId
+        -> BoundLHS s v env env'
+copyLHS (BoundLHSsingle e sv) c = BoundLHSsingle (copyEnvVal e c) sv
+copyLHS (BoundLHSwildcard tr) _ = BoundLHSwildcard tr
+copyLHS (BoundLHSpair l r) c = BoundLHSpair (copyLHS l c) (copyLHS r c)
 
 
 --------------------------------------------------------------------------------
 -- Labelled Arguments
 --------------------------------------------------------------------------------
+newtype ArgL = ArgL Int
+  deriving (Eq, Ord, Show, Num)
+
+-- | Create a fresh 'ArgL' from the current state.
+freshAL :: State ArgL ArgL
+freshAL = id <%= (+1)
 
 -- | A label to add to function arguments.
 --
@@ -424,6 +444,7 @@ data ArgLabel t where
   -- | The argument is an array.
   Arr     :: EnvVals (Buffers e)  -- ^ The array values.
           -> EnvVals sh           -- ^ The shape values.
+          -> ArgL -- unique
           -> ArgLabel (m sh e)
   -- | The argument is a scalar 'Var'', 'Exp'' or 'Fun''.
   NotArr  :: Nodes GVal  -- ^ The variables referenced by the argument.
@@ -434,13 +455,13 @@ deriving instance Show (ArgLabel t)
 
 -- | Get the set of dependent buffers of an 'ArgLabel'.
 getLabelDeps :: ArgLabel t -> Nodes GVal
-getLabelDeps (Arr (_, arr, _) (_, sh, _)) = valsNodes arr <> valsNodes sh
+getLabelDeps (Arr (_, arr, _, _) (_, sh, _, _) _) = valsNodes arr <> valsNodes sh
 getLabelDeps (NotArr deps) = deps
 
 
 -- | Get the set of unique array dependencies of an 'ArgLabel'.
 getLabelUniqueArrDeps :: ArgLabel t -> Nodes GVal
-getLabelUniqueArrDeps (Arr (_, arr, u) _) = uniqueNodes u arr
+getLabelUniqueArrDeps (Arr (_, arr, u, _) _ _) = uniqueNodes u arr
 getLabelUniqueArrDeps (NotArr _) = internalError "getLabelUniqueArrDeps: Expected Arr but got NotArr"
 
 
@@ -455,7 +476,7 @@ uniqueNodes _ _ = internalError "uniqueNodes: Tuple mismatch "
 
 -- | Get the arrays of an 'ArgLabel'.
 getLabelArrays :: ArgLabel (m sh e) -> GroundVals (Buffers e)
-getLabelArrays (Arr (_, arr, _) (_, _, _)) = arr
+getLabelArrays (Arr (_, arr, _, _) _ _) = arr
 getLabelArrays (NotArr _) = internalError "getLabelArrays: Expected Arr but got NotArr"
 
 
@@ -471,7 +492,7 @@ getLabelArrDep = foldr1 const . getLabelArrDeps
 
 -- | Get the shapes of an 'ArgLabel'.
 getLabelShape :: ArgLabel (m sh e) -> GroundVals sh
-getLabelShape (Arr (_, _, _) (_, sh, _)) = sh
+getLabelShape (Arr _ (_, sh, _, _) _) = sh
 getLabelShape (NotArr _) = internalError "getLabelShape: Expected Arr but got NotArr"
 
 
@@ -496,22 +517,20 @@ data LabelledArg env t = L (Arg env t) (ArgLabel t)
 type LabelledArgs env = PreArgs (LabelledArg env)
 
 
--- | Node the arguments to a function using the given environment.
-labelArgs :: Args env args -> Env env -> LabelledArgs env args
-labelArgs (arg :>: args) env = labelArg arg env :>: labelArgs args env
-labelArgs ArgsNil _ = ArgsNil
+-- | Label the arguments to a function using the given environment.
+labelArgs :: Args env args -> Env env -> State ArgL (LabelledArgs env args)
+labelArgs (arg :>: args) env = labelArg arg env >>= \a -> (a:>:) <$> labelArgs args env
+labelArgs ArgsNil _ = pure ArgsNil
 
 
 -- | Get the 'ArgLabels' associated with 'Arg' from 'Env'.
-labelArg :: Arg env t -> Env env -> LabelledArg env t
-labelArg arg env = L arg $ case arg of
-  (ArgVar vars) -> NotArr $ getVarsDeps vars env
-  (ArgExp exp)  -> NotArr $ getExpDeps  exp  env
-  (ArgFun fun)  -> NotArr $ getFunDeps  fun  env
+labelArg :: Arg env t -> Env env -> State ArgL (LabelledArg env t)
+labelArg arg env = L arg <$> case arg of
+  (ArgVar vars) -> pure $ NotArr $ getVarsDeps vars env
+  (ArgExp exp)  -> pure $ NotArr $ getExpDeps  exp  env
+  (ArgFun fun)  -> pure $ NotArr $ getFunDeps  fun  env
   (ArgArray _ _ sh arr) ->
-    Arr (lookupVars arr env) (lookupVars sh env)
-
-
+    Arr (lookupVars arr env) (lookupVars sh env) <$> freshAL
 
 -- | Get the dependencies of a tuple of variables.
 getVarsDeps :: Vars s env t -> Env env -> Nodes GVal
@@ -635,21 +654,21 @@ forLArgs_ largs f = traverseLArgs_ f largs
 -- | All arrays that the function reads from.
 inputArrays :: LabelledArgs env t -> Nodes GVal
 inputArrays = foldMapLArgs \case
-  L (ArgArray In  _ _ _) (Arr (_,arr,_) _) -> valsNodes arr
-  L (ArgArray Mut _ _ _) (Arr (_,arr,_) _) -> valsNodes arr
+  L (ArgArray In  _ _ _) (Arr (_,arr,_,_) _ _) -> valsNodes arr
+  L (ArgArray Mut _ _ _) (Arr (_,arr,_,_) _ _) -> valsNodes arr
   _ -> mempty
 
 -- | All arrays that the function writes to.
 outputArrays :: LabelledArgs env t -> Nodes GVal
 outputArrays = foldMapLArgs \case
-  L (ArgArray Out _ _ _) (Arr (_,arr,_) _) -> valsNodes arr
-  L (ArgArray Mut _ _ _) (Arr (_,arr,_) _) -> valsNodes arr
+  L (ArgArray Out _ _ _) (Arr (_,arr,_,_) _ _) -> valsNodes arr
+  L (ArgArray Mut _ _ _) (Arr (_,arr,_,_) _ _) -> valsNodes arr
   _ -> mempty
 
 -- | All non-array arguments and array shapes.
 notArrays :: LabelledArgs env t -> Nodes GVal
 notArrays = foldMapLArgs \case
-  L _ (Arr _ (_,sh,_)) -> valsNodes sh
+  L _ (Arr _ (_,sh,_,_) _) -> valsNodes sh
   L _ (NotArr deps)    -> deps
 
 -- | Fold map over all inputs.

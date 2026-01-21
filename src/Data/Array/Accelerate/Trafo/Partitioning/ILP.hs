@@ -10,7 +10,7 @@ module Data.Array.Accelerate.Trafo.Partitioning.ILP where
 
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Graph
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Solve
-    ( interpretClusters, makeILP, splitExecs, ClusterLs, Objective (..), interpretReadDirs, interpretWriteDirs, interpretInplaceUpdates )
+    ( interpretClusters, makeILP, splitExecs, ClusterLs, Objective (..), interpretReadDirs, interpretInplaceUpdates, FusionGraphC, fusionGraphC, ReadCopiesM, interpretReadCopies)
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Clustering
     ( reconstruct, reconstructF, ReadDirM, InplaceM )
 import Data.Array.Accelerate.AST.Partitioned
@@ -74,7 +74,7 @@ ilpFusionF solver objective fun = ilpFusion' mkFullGraphF (reconstructF fun Fals
 
 ilpFusion' :: (MakesILP op, SimplifyOperation op, ILPSolver s op)
            => (x -> FullGraph op)
-           -> (FusionGraph -> [ClusterLs] -> Map (Node Comp) [ClusterLs] -> Symbols op -> ReadDirM -> InplaceM -> y)
+           -> (FusionGraphC -> [ClusterLs] -> Map (Node Comp) [ClusterLs] -> Symbols op -> ReadDirM -> InplaceM -> ReadCopiesM -> y)
            -> s
            -> Objective
            -> x
@@ -86,9 +86,10 @@ ilpFusion' toGraph fromGraph s obj acc = do
   let symbols'  = attachBackendLabels solution (fullgraph^.symbols)
   let readDirM  = interpretReadDirs  solution
   -- let writeDirM = interpretWriteDirs solution
+  let readCopyM = interpretReadCopies solution (fullgraph^.lookupEnv)
   let inplaceM  = interpretInplaceUpdates solution
   let (topClusters, subClustersM) = splitExecs (interpretClusters solution) symbols'
-  fromGraph (fullgraph^.fusionILP.graph) topClusters subClustersM symbols' readDirM inplaceM
+  fromGraph (fusionGraphC solution $ fullgraph^.fusionILP.graph) topClusters subClustersM symbols' readDirM inplaceM readCopyM
 
 traceGraph :: FullGraph op -> FullGraph op
 traceGraph g = unsafePerformIO $ do
@@ -128,7 +129,7 @@ ppScopedClusters (top, sub) = "top =\n" ++ ppList top ++ foldMapWithKey (\k v ->
 -- more rigorous is to change 'topSort' in Clustering.hs into separating each cluster completely
 noFusion' :: (MakesILP op, SimplifyOperation op, ILPSolver s op)
            => (x -> FullGraph op)
-           -> (FusionGraph -> [ClusterLs] -> Map (Node Comp) [ClusterLs] -> Symbols op -> ReadDirM -> InplaceM -> y)
+           -> (FusionGraphC -> [ClusterLs] -> Map (Node Comp) [ClusterLs] -> Symbols op -> ReadDirM -> InplaceM -> ReadCopiesM -> y)
            -> s
            -> Objective
            -> x
@@ -154,7 +155,7 @@ noFusion' = undefined
 -- it's perhaps more of an 'alternative' than a 'baseline'
 greedyFusion' :: forall s op x y. (MakesILP op, SimplifyOperation op, ILPSolver s op)
                     => (x -> FullGraph op)
-                    -> (FusionGraph -> [ClusterLs] -> Map (Node Comp) [ClusterLs] -> Symbols op -> ReadDirM -> InplaceM -> y)
+                    -> (FusionGraphC -> [ClusterLs] -> Map (Node Comp) [ClusterLs] -> Symbols op -> ReadDirM -> InplaceM -> ReadCopiesM -> y)
                     -> s
                     -> Benchmarking
                     -> Objective

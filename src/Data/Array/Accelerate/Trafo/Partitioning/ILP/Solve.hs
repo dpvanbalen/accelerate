@@ -1,15 +1,16 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE GADTs #-}
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 module Data.Array.Accelerate.Trafo.Partitioning.ILP.Solve where
 
 
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Graph hiding (graph, constraints, bounds)
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Labels
-    (Node, parent, Nodes, Comp, GVal)
+    (Node, parent, Nodes, Comp, GVal, CopyId, ArgL)
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Solver hiding (finalize)
 
 import Data.List (groupBy, sortOn)
@@ -29,6 +30,11 @@ import Data.Maybe (fromJust,  mapMaybe )
 import Control.Monad.State
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.NameGeneration (freshName)
 import Data.Foldable
+
+import qualified Debug.Trace
+
+
+mAXCOPIES = 2
 
 data Objective
   -- Old fusion only objectives:
@@ -95,7 +101,7 @@ makeILP obj (FusionILP graph constraints bounds) =
     m = S.size buffN
 
     maxcopies :: Node a -> Int
-    maxcopies = const 0
+    maxcopies = const mAXCOPIES
 
     ----------------------------------------------------------------------------
     -- Fusion:
@@ -161,15 +167,34 @@ makeILP obj (FusionILP graph constraints bounds) =
       Everything  -> foldMap (\l -> foldMap (\i -> pi l i .<=. numberOfClusters) [0 .. maxcopies l]) compN
       _ -> mempty
 
-    -- forcing each copy to read from exactly one copy for each (data?) edge
-    copyC = foldMap
-              (\e@(i,j) -> foldMap
-                            (\jc -> int 1 .==. foldr (\ic s -> s .+. readCopy i ic j jc) (int 0) [0..maxcopies i])
-                            [0..maxcopies j])
-              (fusibleE' <> infusibleE' <> strictE)
-
     fusionConstraints = fusibleAcyclicC <> strictAcyclicC <> infusibleC <> manifestC
       <> numberOfClustersC <> readC <> fusionOrderC <> finalize graph <> copyC
+
+    -- forcing each copy to read from exactly one copy for each (data?) edge, if used, and otherwise none
+    copyC = foldMap
+              (\e@(i,j) -> foldMap
+                            -- maxcopies i + 1 binary variables, need one or zero on 0 and the rest on 1
+                            (\jc -> int (maxcopies i) {- .+. var (UseCopy j jc) -} .==. foldr (\ic s -> s .+. readCopy i ic j jc) (int 0) [0..maxcopies i])
+                            [0..maxcopies j])
+              (fusibleE' <> infusibleE' <> strictE)
+        -- and to decide how many copies are in use:
+        <> foldMap (
+            \n -> foldMap (\nc -> timesN (var (UseCopy n nc)) .>=. int nc .-. copies n) [0..maxcopies n]
+            ) compN
+            -- force copy 0 in use
+        <> foldMap 
+            (\n -> var (UseCopy n 0) .==. int 0) 
+            compN
+            -- force readcopy to propagate usecopies
+        <> foldMap 
+            (\e@(i,j) -> foldMap
+                          (\jc -> foldMap
+                                    -- if j jc is in use and it reads from i ic, i ic needs to be in use
+                                    (\ic -> var (UseCopy i ic) .<=. var (UseCopy j jc) .+. var (ReadCopy i ic j jc))
+                                    [0..maxcopies i])
+                          [0..maxcopies j])
+            (fusibleE' <> infusibleE' <> strictE)
+
 
     -- x_ij <= pi_j - pi_i <= n*x_ij for all fusible edges
     -- this constraint only needs to hold if readcopy i k j l == 0, i.e. between the copies of i and j that read from each other
@@ -180,29 +205,49 @@ makeILP obj (FusionILP graph constraints bounds) =
                                       [(k,l) | k <- [0..maxcopies i], l <- [0..maxcopies j]]) 
                         fusibleE'
 
-    -- pi_i < pi_j for all strict edges  NEW!
-    strictAcyclicC = foldMap (\(i,j) -> pi i 0 .<. pi j 0) strictE
+    -- pi_i < pi_j for all strict edges
+    -- strictAcyclicC = foldMap (\(i,j) -> pi i 0 .<. pi j 0) strictE
+    strictAcyclicC = foldMap 
+                      (\(i,j) -> 
+                        foldMap
+                          (\(k,l) -> pi j l .-. pi i k .>=. int 0 .-. timesN (readCopy i k j l)) -- j - i >= 0 if relevant, and >= -inf if not
+                          [(k,l) | k <- [0..maxcopies i], l <- [0..maxcopies j]] 
+                        ) 
+                      strictE
 
     -- x_ij == 1 for all infusible edges
-    infusibleC = foldMap (\e -> fused e 0 .==. int 1) infusibleE'
+    -- infusibleC = foldMap (\e -> fused e 0 .==. int 1) infusibleE'
+    infusibleC = foldMap (\e@(i,j) -> foldMap (\l -> fused e l .==. int 1) [0..maxcopies j]) infusibleE'
 
     -- forall b, iff all (w,b,r) are fused, then b is not manifest.
-    manifestC = M.foldMapWithKey (\b es -> allB (map (($0) . fused) es) (notB $ manifest b))
-              $ foldl (flip \(i,b,j) -> M.insertWith (<>) b [(i,j)]) M.empty dataflowE
+    -- only applicable to copy number 0; all other copies are never manifest.
+    manifestC = (M.foldMapWithKey (\b es -> allB (map (($0) . fused) es) (notB $ manifest b))
+              $ foldl (flip \(i,b,j) -> M.insertWith (<>) b [(i,j)]) M.empty dataflowE)
+              -- TODO: <> make copies nonmanifest
 
     -- if (w,b,r) is fused, then d_wb == d_br
-    fusionOrderC = flip foldMap fusibleE $ \(w,b,r) ->
-                  timesN (fused (w,r) 0) .>=. readDir (b,r) 0 .-. writeDir (w,b)
-      <> (-1) .*. timesN (fused (w,r) 0) .<=. readDir (b,r) 0 .-. writeDir (w,b)
+    fusionOrderC = flip foldMap fusibleE $ \(w,b,r) -> flip foldMap [(wc,rc) | wc <- [0..maxcopies w], rc <- [0..maxcopies r]] $ \(wc,rc) ->
+                  timesN (fused (w,r) rc .+. readCopy w wc r rc) .>=. readDir (b,r) rc .-. writeDir (w,b) wc
+      <> (-1) .*. timesN (fused (w,r) rc .+. readCopy w wc r rc) .<=. readDir (b,r) rc .-. writeDir (w,b) wc
 
     fusionBounds :: Bounds op
-    fusionBounds = piB <> fusedB <> manifestB <> readB
+    fusionBounds = piB <> fusedB <> manifestB <> readB <> copyB
+
+    copyB = foldMap (\(i,ic) -> binary $ UseCopy i ic) [(i,ic) | i <- S.toList compN, ic <- [0..maxcopies i]]
+         <> foldMap (\i -> lowerUpper 0 (Copies i) (maxcopies i)) compN
+         <> foldMap
+              (\e@(i,j) -> foldMap
+                (\jc -> foldMap 
+                  (\ic -> binary (ReadCopy i ic j jc)) 
+                  [0..maxcopies i])
+                [0..maxcopies j])
+              (fusibleE' <> infusibleE' <> strictE)
 
     --  0 <= pi_i <= n
-    piB = foldMap (\i -> lowerUpper 0 (Pi i 0) n) compN
+    piB = foldMap (\(i,ic) -> lowerUpper 0 (Pi i ic) n) [(c,cc) | c <- S.toList compN, cc <- [0..maxcopies c]]
 
     -- 0 <= x_ij <= 1
-    fusedB = foldMap (binary . ($0) . uncurry Fused) $ S.map (\(i,_,j) -> (i,j)) dataflowE
+    fusedB = foldMap (binary . uncurry3 Fused) $ foldMap (\(i,_,j) -> map (i,j,) [0..maxcopies j]) $ S.toList dataflowE
 
     -- 0 <= m_i  <= 1
     manifestB = foldMap (binary . IsManifest) buffN
@@ -223,6 +268,7 @@ makeILP obj (FusionILP graph constraints bounds) =
     weightedNumberOfNonInplaceUpdates = M.foldMapWithKey (\p w -> w .*. inplace p) inplacePweights
 
     -- If inplace p, then c1 == c2
+    -- Only supporting inplace for non-copies, because copies are never manifest
     acrossClusterC = flip foldMap inplaceP \case
       p@((_,c1),(c2,_))
         | c1 == c2  -> mempty
@@ -235,24 +281,28 @@ makeILP obj (FusionILP graph constraints bounds) =
     singleReadC  = foldMap (packB 1) $ foldl (flip \p@((b,_),_) -> M.insertWith (<>) b [inplace p]) M.empty inplaceP
     singleWriteC = foldMap (packB 1) $ foldl (flip \p@(_,(_,b)) -> M.insertWith (<>) b [inplace p]) M.empty inplaceP
 
-    -- If inplace p, then pimax b1 >= pi c2
+    -- If inplace p, then pimax b1 <= pi c2
     inplaceClusterC = foldMap (\p@((b1,_),(c2,_)) -> (pimax b1 .-. pi c2 0) .<=. timesN (inplace p)) inplaceP
 
     -- Iff     inplace p, then pi c1     <= pimax b1
     -- Iff not inplace p, then pi c1 + 1 <= pimax b1
     -- finalClusterC = foldMap (\p@((b1,c1),_) -> pi c1 .+. inplace p .<=. pimax b1) inplaceP
-    finalClusterC = foldMap (\r@(b1,c1) -> pi c1 0 .+. int 1 .-. foldMap (\w -> int 1 .-. inplace (r,w)) (M.findWithDefault [] r readM) .<=. pimax b1) readE
+    finalClusterC = foldMap (\r@(b1,c1) -> 
+                      foldMap (\rc -> 
+                        pi c1 rc .+. int 1 .-. foldMap (\w -> int 1 .-. inplace (r,w)) (M.findWithDefault [] r readM) .<=. pimax b1)
+                      [0..maxcopies c1]) 
+                    readE
 
     -- Group inplace paths by read edge:
     readM = foldl (flip \(r,w) -> M.insertWith (<>) r [w]) M.empty inplaceP
 
     -- TODO: Maybe add a constraint that c2 is the first writer to b2?
-    -- This would make sense because the graph doesn't acctually enforce there is only one writer per buffer.
+    -- This would make sense because the graph doesn't actually enforce there is only one writer per buffer.
     -- For most cases there shouldn't be more than 2 writers, one of which is a let-binding, so no issues arise without this constraint.
     -- However, a mutable computation would create a third writer, which would be a problem.
 
     -- If inplace p, then d_br == d_wb
-    inplaceOrderC = foldMap (\p@(r,w) -> isEqualRangeN (readDir r 0) (writeDir w) (inplace p)) inplaceP
+    inplaceOrderC = foldMap (\p@(r,w) -> isEqualRangeN (readDir r 0) (writeDir w 0) (inplace p)) inplaceP
 
     inplaceConstraints = acrossClusterC <> onManifestC <> singleReadC <> singleWriteC <> inplaceClusterC <> finalClusterC <> inplaceOrderC
 
@@ -295,27 +345,37 @@ makeILP obj (FusionILP graph constraints bounds) =
 
 
 -- | Extract the read directions from the ILP solution.
-interpretReadDirs :: forall op. Solution op -> M.Map ReadEdge Int
+interpretReadDirs :: forall op. Solution op -> M.Map (ReadEdge, CopyId) Int
 interpretReadDirs = M.fromList . mapMaybe (_1 fromReadDir) . M.toList
   where
-    fromReadDir :: Var op -> Maybe ReadEdge
-    fromReadDir (ReadDir b c 0) = Just (b, c)
+    fromReadDir :: Var op -> Maybe (ReadEdge, CopyId)
+    fromReadDir (ReadDir b c i) = Just ((b, c),i)
     fromReadDir _             = Nothing
 
--- | Extract the write directions from the ILP solution.
-interpretWriteDirs :: forall op. Solution op -> M.Map WriteEdge Int
-interpretWriteDirs = M.fromList . mapMaybe (_1 fromWriteDir) . M.toList
+-- -- | Extract the write directions from the ILP solution.
+-- interpretWriteDirs :: forall op. Solution op -> M.Map WriteEdge Int
+-- interpretWriteDirs = M.fromList . mapMaybe (_1 fromWriteDir) . M.toList
+--   where
+--     fromWriteDir :: Var op -> Maybe WriteEdge
+--     fromWriteDir (WriteDir c b 0) = Just (c, b)
+--     fromWriteDir _              = Nothing
+
+type ReadCopiesM = M.Map (Node Comp, CopyId, ArgL) CopyId
+interpretReadCopies :: Solution op -> LookupEnv -> ReadCopiesM
+interpretReadCopies sol env = foldr f M.empty . M.toList $ sol
   where
-    fromWriteDir :: Var op -> Maybe WriteEdge
-    fromWriteDir (WriteDir c b) = Just (c, b)
-    fromWriteDir _              = Nothing
+    f (ReadCopy s cs n cn, 0) m = case (env M.!? (s,n)) of 
+        Just al -> M.insert (n, cn, al) cs m
+        Nothing -> m
+    f _ m = m
 
 -- | Extract the top-level clusters and the sub-scoped clusters from the ILP
 --   solution.
-interpretClusters :: Solution op -> ([Nodes Comp], M.Map (Node Comp) [Nodes Comp])
+interpretClusters :: MakesILP op => Solution op -> ([S.Set (Node Comp, CopyId)], M.Map (Node Comp) [S.Set (Node Comp, CopyId)])
 interpretClusters sol = do
-  let            piVars  = mapMaybe (_1 fromPi) (M.toList sol)               -- Take the Pi variables.
-  let      scopedPiVars  = partition (^._1.parent) piVars                    -- Partition them by their parent (i.e. the scope they are in).
+  let            piVars' = mapMaybe (_1 fromPi) (M.toList sol)               -- Take the Pi variables.
+  let            piVars  = filter (inUse . fst) piVars'
+  let      scopedPiVars  = partition (^._1._1.parent) piVars                    -- Partition them by their parent (i.e. the scope they are in).
   let   clusteredPiVars  = map (partition snd) scopedPiVars                  -- Partition them again by their cluster (i.e. the value of the variable).
   let    scopedClusters  = map (map $ S.fromList . map fst) clusteredPiVars  -- Remove the cluster numbers and convert each cluster to a set.
   let       topClusters  = head scopedClusters  -- The first scope in the list is the top-level scope.
@@ -323,12 +383,17 @@ interpretClusters sol = do
   let subScopedClustersM = M.fromList $ map (\s -> (scopeLabel s, s)) subScopedClusters
   (topClusters, subScopedClustersM)
   where
-    fromPi :: Var op -> Maybe (Node Comp)
-    fromPi (Pi l _) = Just l
+    fromPi :: Var op -> Maybe (Node Comp, CopyId)
+    fromPi (Pi l c) = Just (l, c)
     fromPi _      = Nothing
 
-    scopeLabel :: [Nodes Comp] -> Node Comp
-    scopeLabel = fromJust . view parent . S.findMin . head
+    scopeLabel :: [S.Set (Node Comp, CopyId)] -> Node Comp
+    scopeLabel = fromJust . (view parent . fst) . S.findMin . head
+
+    inUse :: (Node Comp, CopyId) -> Bool
+    inUse (n, c) = case sol M.!? UseCopy n c of
+      Nothing -> False
+      Just x -> x == 0
 
 -- | `groupBy` except it's equivalent to SQL's `GROUP BY` clause.
 partition :: Ord b => (a -> b) -> [a] -> [[a]]
@@ -348,17 +413,43 @@ interpretInplaceUpdates sol = M.map firstInChain inplaceM
     firstInChain b = maybe b firstInChain (M.lookup b inplaceM)
 
 -- | Cluster labels, distinguishing between execute and non-execute labels.
-data ClusterLs = Execs (Nodes Comp) | NonExec (Node Comp)
+data ClusterLs = Execs (S.Set (Node Comp, CopyId)) | NonExec (Node Comp, CopyId)
   deriving (Eq, Show)
+
+type StrictEdgeC    = ((Node Comp, CopyId), (Node Comp, CopyId))
+type DataflowEdgeC  = ((Node Comp, CopyId), Node GVal, (Node Comp, CopyId))
+data FusionGraphC = FusionGraphCopy
+  { _compNodesC     :: S.Set (Node Comp, CopyId)         -- ^ Computation nodes.
+  -- , _valueNodes    :: S.Set (Node GVal)         -- ^ Value nodes.
+  , _strictEdgesC   :: S.Set StrictEdgeC          -- ^ Edges that enforce strict ordering.
+  , _dataflowEdgesC :: S.Set DataflowEdgeC        -- ^ Edges that represent data-flow.
+  }
+
+fusionGraphC :: MakesILP op => Solution op -> FusionGraph -> FusionGraphC
+fusionGraphC sol (FusionGraph nodes _ strict dataflow _) = (\x@(FusionGraphCopy nc sc dc) -> Debug.Trace.trace (sz nodes <> " " <> sz nc <> " " <> sz strict <> " " <> sz sc <> " " <> sz dataflow <> " " <> sz dc) x) $
+  FusionGraphCopy 
+    (S.unions $ S.map (\n -> S.map (\(Pi m c) -> (m,c)) $ flip S.filter (M.keysSet sol) \case
+      Pi m c -> m == n && sol M.! UseCopy m c == 0
+      _ -> False
+      ) nodes)
+    -- for each edge(a,c), for each copy of c that is in use, find the copy of a it reads from 
+    (S.unions $ S.map (\(a,c) -> S.map (\(ReadCopy _ ac _ cc) -> ((a,ac),(c,cc))) $ M.keysSet $ M.filterWithKey (\case
+      ReadCopy a' ac c' cc -> \i -> i == 0 && c' == c && a' == a && 0 == sol M.! UseCopy c cc
+      _ -> const False) sol) strict) 
+    (S.unions $ S.map (\(a,b,c) -> S.map (\(ReadCopy _ ac _ cc) -> ((a,ac),b,(c,cc))) $ M.keysSet $ M.filterWithKey (\case
+      ReadCopy a' ac c' cc -> \i -> i == 0 && c' == c && a' == a && 0 == sol M.! UseCopy c cc
+      _ -> const False) sol) dataflow) 
+  where
+    sz = show . S.size
 
 -- I think that only `let`s can still be in the same cluster as `exec`s,
 -- and their bodies should all be in earlier clusters already.
 -- Simply make one cluster per let, before the cluster with execs.
-splitExecs :: ([Nodes Comp], M.Map (Node Comp) [Nodes Comp]) -> Symbols op -> ([ClusterLs], M.Map (Node Comp) [ClusterLs])
+splitExecs :: ([S.Set (Node Comp, CopyId)], M.Map (Node Comp) [S.Set (Node Comp, CopyId)]) -> Symbols op -> ([ClusterLs], M.Map (Node Comp) [ClusterLs])
 splitExecs (xs, xM) symbolM = (f xs, M.map f xM)
   where
-    f :: [Nodes Comp] -> [ClusterLs]
-    f = concatMap (\ls -> filter (/= Execs mempty) $ map NonExec (S.toList $ S.filter isBeforeExec ls) ++ [Execs (S.filter isExec ls)] ++ afterexecs ls)
+    f :: [S.Set (Node Comp, CopyId)] -> [ClusterLs]
+    f = concatMap (\ls -> filter (/= Execs mempty) $ map NonExec (S.toList $ S.filter (isBeforeExec . fst) ls) ++ [Execs (S.filter (isExec . fst) ls)] ++ afterexecs ls)
 
     isExec :: Node Comp -> Bool
     isExec l = case symbolM M.!? l of
@@ -377,7 +468,7 @@ splitExecs (xs, xM) symbolM = (f xs, M.map f xM)
     -- Tests say that this happens, and that it's correct anyway, but I'm unsure why.
     -- The reason I doubt is because if multiple non-exec, non-lhs nodes are here, the current reconstruction code
     -- (I think) ignores all but the last one.
-    afterexecs ls = let xs = map NonExec (S.toList $ S.filter isAfterExec ls) in if length xs > 1 then xs {-error "dunno what this means"-} else xs
+    afterexecs ls = let xs = map NonExec (S.toList $ S.filter (isAfterExec . fst) ls) in if length xs > 1 then xs {-error "dunno what this means"-} else xs
 
 -- Only needs Applicative
 newtype MonadMonoid f m = MonadMonoid { getMonadMonoid :: f m }
@@ -388,3 +479,6 @@ instance (Monad f, Monoid m) => Monoid (MonadMonoid f m) where
 
 foldMapM :: (Foldable t, Monad f, Monoid m) => (a -> f m) -> t a -> f m
 foldMapM f = getMonadMonoid . foldMap (MonadMonoid . f)
+
+uncurry3 :: (a -> b -> c -> d) -> (a,b,c) -> d
+uncurry3 f (a,b,c) = f a b c

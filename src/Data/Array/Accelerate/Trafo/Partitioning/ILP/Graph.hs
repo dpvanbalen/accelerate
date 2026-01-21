@@ -1,5 +1,6 @@
 {-# LANGUAGE AllowAmbiguousTypes      #-}
 {-# LANGUAGE BlockArguments           #-}
+{-# LANGUAGE DeriveFunctor            #-}
 {-# LANGUAGE FlexibleContexts         #-}
 {-# LANGUAGE FlexibleInstances        #-}
 {-# LANGUAGE FunctionalDependencies   #-}
@@ -7,6 +8,7 @@
 {-# LANGUAGE InstanceSigs             #-}
 {-# LANGUAGE KindSignatures           #-}
 {-# LANGUAGE LambdaCase               #-}
+{-# LANGUAGE OverloadedStrings        #-}
 {-# LANGUAGE RankNTypes               #-}
 {-# LANGUAGE ScopedTypeVariables      #-}
 {-# LANGUAGE StandaloneDeriving       #-}
@@ -16,7 +18,6 @@
 {-# LANGUAGE TypeFamilyDependencies   #-}
 {-# LANGUAGE UndecidableInstances     #-}
 {-# LANGUAGE ViewPatterns             #-}
-{-# LANGUAGE OverloadedStrings        #-}
 {-# OPTIONS_GHC -Wno-orphans          #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE PatternSynonyms #-}
@@ -46,13 +47,15 @@ import Data.Set (Set)
 import Data.Map (Map)
 import qualified Data.Set as S
 import qualified Data.Map as M
+import qualified Data.Maybe
 
 import Lens.Micro
 import Lens.Micro.Mtl
 
-import Control.Monad.State.Strict (State, runState)
+import Control.Monad.State.Strict (State, runState, mapM_)
 import Data.Composition
 import Data.Foldable (Foldable (foldr'), traverse_, toList)
+import qualified Data.Functor.Const as C
 import Data.Kind (Type)
 import Debug.Trace
 import Unsafe.Coerce (unsafeCoerce)
@@ -464,7 +467,7 @@ data Var (op :: Type -> Type)
     -- Binary variable; will we write the output to a manifest array, or is it fused away (i.e. all uses are in its cluster)?
   | ReadDir (Node GVal) (Node Comp) CopyId
     -- ^ \-3 can't fuse with anything, -2 for 'left to right', -1 for 'right to left', n for 'unknown', see computation n (currently only backpermute).
-  | WriteDir (Node Comp) (Node GVal)
+  | WriteDir (Node Comp) (Node GVal) CopyId
     -- ^ See 'ReadDir'.
   | InFoldSize (Node Comp) CopyId  -- Legacy? Probably needs per-edge equivalent
     -- ^ Keeps track of the fold that's one dimension larger than this operation, and is fused in the same cluster.
@@ -488,14 +491,14 @@ data Var (op :: Type -> Type)
   -- | WriteDirPiMax (Node GVal)
   --   -- ^ The write direction of the largest reader of the buffer. This is used to check that all reads of the buffer are in the same direction as the write.
 
-  -- WIP: work duplication
+  -- work duplication
   | Copies (Node Comp)
   -- ^ Number of times this computation is duplicated: 0 for no duplication, 1 more for each 'copy'
+  | UseCopy (Node Comp) CopyId
+  -- binary: 0 for 'in use' and 1 for 'not used'.
   | ReadCopy (Node Comp) CopyId {-(Node GVal)-} (Node Comp) CopyId
   -- ^ Is copy $5 of computation $4 reading from the version of array $3 that copy $2 of computation $1 makes?
   -- 0 yes, 1 no
-
-type CopyId = Int
 
 deriving instance Eq   (BackendVar op) => Eq   (Var op)
 deriving instance Ord  (BackendVar op) => Ord  (Var op)
@@ -526,12 +529,12 @@ readDirs :: Foldable f => f (ReadEdge, CopyId) -> [Expression op]
 readDirs = map (uncurry readDir) . toList
 
 -- | Safe constructor for 'WriteDir' variables.
-writeDir :: WriteEdge -> Expression op
-writeDir = var . uncurry WriteDir
+writeDir :: WriteEdge -> CopyId -> Expression op
+writeDir = var .* uncurry WriteDir
 
 -- | Convert a foldable structure of 'WriteEdge' to a list of 'Expression's.
-writeDirs :: Foldable f => f WriteEdge -> [Expression op]
-writeDirs = map writeDir . toList
+writeDirs :: Foldable f => f (WriteEdge, CopyId) -> [Expression op]
+writeDirs = map (uncurry writeDir) . toList
 
 -- | Safe constructor for 'InPlace' variables.
 inplace :: InplacePath -> Expression op
@@ -606,12 +609,40 @@ reindexLabelledArgOp k (LOp (ArgArray m repr sh buffers) l o) = (\x -> LOp x l o
 reindexLabelledArgsOp :: Applicative f => ReindexPartial f env env' -> LabelledArgsOp op env t -> f (LabelledArgsOp op env' t)
 reindexLabelledArgsOp = reindexPreArgs reindexLabelledArgOp
 
+reindexPreArgsNCM
+  :: (forall t'. ReindexPartial NeedsCopyMaybe env env' ->          s env  t' -> NeedsCopyMaybe          (s env'  t'))
+              -> ReindexPartial NeedsCopyMaybe env env' -> PreArgs (s env) t  -> NeedsCopyMaybe (PreArgs (s env') t)
+reindexPreArgsNCM _ _ ArgsNil = pure ArgsNil
+reindexPreArgsNCM reindex k (a :>: as) = (:>:) <$> reindex k a <*> reindexPreArgsNCM reindex k as
+
+reindexVarsCopy :: ReindexPartial NeedsCopyMaybe env env' -> Vars s env t -> TupR (C.Const CopyId) t -> NeedsCopyMaybe (Vars s env' t)
+reindexVarsCopy k (TupRsingle var) (TupRsingle (C.Const c))   = (\(NCM f) -> NCM $ \_ -> f c) $ TupRsingle <$> reindexVar k var
+reindexVarsCopy k (TupRpair v1 v2) (TupRpair cl cr) = TupRpair <$> reindexVarsCopy k v1 cl <*> reindexVarsCopy k v2 cr
+reindexVarsCopy _ TupRunit         TupRunit         = pure TupRunit
+
+reindexLabelledArgOpCopy :: ReindexPartial NeedsCopyMaybe env env' -> LabelledArgOp op env t -> NeedsCopyMaybe (LabelledArgOp op env' t)
+reindexLabelledArgOpCopy k (LOp (ArgVar vars               ) l o) = (\x -> LOp x l o)  .   ArgVar          <$> reindexVars k vars
+reindexLabelledArgOpCopy k (LOp (ArgExp e                  ) l o) = (\x -> LOp x l o)  .   ArgExp          <$> reindexExp k e
+reindexLabelledArgOpCopy k (LOp (ArgFun f                  ) l o) = (\x -> LOp x l o)  .   ArgFun          <$> reindexExp k f
+reindexLabelledArgOpCopy k (LOp (ArgArray m repr sh buffers) l@(Arr (_,_,_,cs) _ _) o) = (\x -> LOp x l o) <$> (ArgArray m repr <$> reindexVars k sh <*> reindexVarsCopy k buffers cs)
+
+reindexLabelledArgsOpCopy :: ReindexPartial NeedsCopyMaybe env env' -> LabelledArgsOp op env t -> NeedsCopyMaybe (LabelledArgsOp op env' t)
+reindexLabelledArgsOpCopy = reindexPreArgsNCM reindexLabelledArgOpCopy
+
 attachBackendLabels :: MakesILP op => Solution op -> Symbols op -> Symbols op
 attachBackendLabels sol = M.mapWithKey \cases
   l (SExe env largs op) -> SExe' env (labelLabelledArgs sol l largs) op
   _  SExe'{} -> internalError "already converted???"
   _  con -> con
 
+copyLabelledArgsOp :: LabelledArgsOp op env args -> CopyId -> LabelledArgsOp op env args
+copyLabelledArgsOp (arg :>: args) c = copyLabelledArgOp arg c :>: copyLabelledArgsOp args c
+copyLabelledArgsOp ArgsNil _ = ArgsNil
+
+copyLabelledArgOp :: LabelledArgOp op env arg -> CopyId -> LabelledArgOp op env arg
+copyLabelledArgOp (LOp a l b) c = flip (LOp a) b $ case l of
+  NotArr x -> NotArr x
+  Arr x y z -> Arr (copyEnvVals x c) y z
 
 
 --------------------------------------------------------------------------------
@@ -656,17 +687,31 @@ data FusionGraphState op env = FusionGraphState
   , _readersEnv :: ReadersEnv      -- ^ Mapping from buffers to their current consumers.
   , _writersEnv :: WritersEnv      -- ^ Mapping from buffers to their current producers.
   , _allocators :: Allocators      -- ^ Mapping from buffers to their allocator.
+  , _lookupEnv  :: LookupEnv     -- ^ Mapping from writer and reader to arg of reader
   , _symbols    :: Symbols op      -- ^ The symbols for the ILP.
   , _currComp   :: Node Comp      -- ^ The current computation label.
   , _currEnvL   :: EnvLabel        -- ^ The current environment label.
+  , _currArgL   :: ArgL
   }
 
 type ReadersEnv = Map (Node GVal) (Nodes Comp)
 type WritersEnv = Map (Node GVal) (Nodes Comp)
 type Allocators = Map (Node GVal) (Node  Comp)
+type LookupEnv = Map (Node Comp, Node Comp) ArgL
+
+addtolookupenv :: Node Comp -> LabelledArgs env args -> State (FusionGraphState op env) ()
+addtolookupenv n ArgsNil = pure ()
+addtolookupenv n (L arg (Arr (_,arr,_,_) _ l) :>: args) = case arg of
+  ArgArray In _ _ _ -> do
+    let gvals = valsNodes arr
+    writers <- use writersEnv >>= (\m -> pure . S.unions $ S.map (Data.Maybe.fromJust . (m M.!?)) gvals)
+    mapM_ (\w -> lookupEnv %= M.insert (w, n) l) writers
+    addtolookupenv n args
+  _ -> addtolookupenv n args
+addtolookupenv n (_ :>: args) = addtolookupenv n args
 
 initialFusionGraphState :: FusionGraphState op ()
-initialFusionGraphState = FusionGraphState mempty EnvNil mempty mempty mempty mempty (Node 0 Nothing) 0
+initialFusionGraphState = FusionGraphState mempty EnvNil mempty mempty mempty mempty mempty (Node 0 Nothing) 0 0
 
 -- instance Show (FusionGraphState op env) where
 --   show :: FusionGraphState op env -> String
@@ -713,11 +758,22 @@ instance HasSymbols (FusionGraphState op env) op where
   symbols :: Lens' (FusionGraphState op env) (Symbols op)
   symbols f s = f (_symbols s) <&> \sym -> s{_symbols = sym}
 
+class HasWritingEnv s where
+  lookupEnv :: Lens' s LookupEnv
+
+instance HasWritingEnv (FusionGraphState op env) where
+  lookupEnv :: Lens' (FusionGraphState op env) LookupEnv
+  lookupEnv f s = f (_lookupEnv s) <&> \env -> s{_lookupEnv = env}
+
+
 currComp :: Lens' (FusionGraphState op env) (Node Comp)
 currComp f s = f (_currComp s) <&> \c -> s{_currComp = c}
 
 currEnvL :: Lens' (FusionGraphState op env) EnvLabel
 currEnvL f s = f (_currEnvL s) <&> \l -> s{_currEnvL = l}
+
+currArgL :: Lens' (FusionGraphState op env) ArgL
+currArgL f s = f (_currArgL s) <&> \l -> s{_currArgL = l}
 
 -- | Lens for creating the backend graph state.
 --
@@ -887,35 +943,38 @@ bindsBuffers c = traverse_ \b -> do
 -- Full Graph construction
 --------------------------------------------------------------------------------
 
-type FullGraph op = (FusionILP op, Symbols op, Allocators)
+type FullGraph op = (FusionILP op, Symbols op, Allocators, LookupEnv)
 
 -- The 2 instances below can be used to clean up the code in ILP.hs a bit.
 instance HasFusionILP (FullGraph op) op where
   fusionILP :: Lens'  (FullGraph op) (FusionILP op)
-  fusionILP f (ilp, sym, alloc) = f ilp <&> (,sym,alloc)
+  fusionILP f (ilp, sym, alloc,w) = f ilp <&> (,sym,alloc,w)
 
 instance HasSymbols (FullGraph op) op where
   symbols :: Lens' (FullGraph op) (Symbols op)
-  symbols f (ilp, sym, alloc) = f sym <&> (ilp,,alloc)
+  symbols f (ilp, sym, alloc,w) = f sym <&> (ilp,,alloc,w)
 
 instance HasAllocators (FullGraph op) where
   allocators :: Lens' (FullGraph op) Allocators
-  allocators f (ilp, sym, alloc) = f alloc <&> (ilp,sym,)
+  allocators f (ilp, sym, alloc,w) = f alloc <&> (ilp,sym,,w)
+
+instance HasWritingEnv (FullGraph op) where
+  lookupEnv :: Lens' (FullGraph op) LookupEnv
+  lookupEnv f (ilp, sym, alloc, w) = f w <&> (ilp,sym,alloc,)
 
 -- | Construct the full fusion graph for a program.
 mkFullGraph :: MakesILP op => PreOpenAcc op () t -> FullGraph op
-mkFullGraph acc = finalizeInplacePaths $ makeManifest (valsNodes res) (s^.fusionILP, s^.symbols, s^.allocators)
+mkFullGraph acc = finalizeInplacePaths $ makeManifest (valsNodes res) (s^.fusionILP, s^.symbols, s^.allocators, s^.lookupEnv)
   where (res, s) = runState (mkFusionGraph acc) initialFusionGraphState
 
 -- | Construct the full fusion graph for a function.
 mkFullGraphF :: MakesILP op => PreOpenAfun op () a -> FullGraph op
-mkFullGraphF acc = finalizeInplacePaths (s^.fusionILP, s^.symbols, s^.allocators)
+mkFullGraphF acc = finalizeInplacePaths (s^.fusionILP, s^.symbols, s^.allocators, s^.lookupEnv)
   where (_, s) = runState (mkFusionGraphF acc) initialFusionGraphState
 
 -- | Make the supplied value nodes manifest.
 makeManifest :: (MakesILP op, HasFusionILP g op) => Nodes GVal -> g -> g
 makeManifest bs = fusionILP.constraints <>~ foldMap (\b -> manifest b .==. int 0) bs
-
 
 --------------------------------------------------------------------------------
 -- FusionGraph construction
@@ -930,10 +989,11 @@ mkFusionGraph (Exec op args) = do
   renv <- use readersEnv
   wenv <- use writersEnv
   c    <- freshComp
-  let labelledArgs = labelArgs args env
+  labelledArgs <- zoom currArgL $ labelArgs args env
   let inpArrs      = inputArrays labelledArgs
   let outArrs      = outputArrays labelledArgs
   let notArrs      = notArrays labelledArgs
+  addtolookupenv c labelledArgs
   c `readsBuffers`   (inpArrs `S.difference`   outArrs)
   c `writesBuffers`  (outArrs `S.difference`   inpArrs)
   c `mutatesBuffers` (inpArrs `S.intersection` outArrs)
@@ -961,7 +1021,7 @@ mkFusionGraph (Alet lhs u bnd body) = do
 mkFusionGraph (Return vars) = do
   env  <- use environment
   retN <- freshComp
-  let (_, bs, _) = lookupVars vars env
+  let (_, bs, _, _) = lookupVars vars env
   retN `returnsBuffers` valsNodes bs
   symbol retN ?= SRet env vars
   return bs
@@ -969,7 +1029,7 @@ mkFusionGraph (Return vars) = do
 mkFusionGraph (Manifest buff) = do
   env  <- use environment
   retN <- freshComp
-  let (_, bs, _) = lookupVar buff env
+  let (_, bs, _, _) = lookupVar buff env
   retN `returnsBuffers` valsNodes bs
   symbol retN ?= SRet env (TupRsingle buff)
   return bs
@@ -1197,11 +1257,23 @@ mkInplacePathsFromClusters g = g&fusionILP.inplacePaths <>~ go initialClusters
 -- Reconstruction
 --------------------------------------------------------------------------------
 
+newtype NeedsCopyMaybe a = NCM (CopyId -> Maybe a)
+  deriving Functor
+instance Applicative NeedsCopyMaybe where
+  pure = NCM . const . Just
+  (NCM a) <*> (NCM b) = NCM $ \c -> a c <*> b c 
+
+fromJustNCM :: NeedsCopyMaybe a -> CopyId -> a
+fromJustNCM (NCM f) c = case f c of
+  Just x -> x
+  Nothing -> error $ show c
+
+
 -- | Makes a ReindexPartial, which allows us to transform indices in @env@ into indices in @env'@.
 -- We cannot guarantee the index is present in env', so we use the partiality of ReindexPartial by
 -- returning a Maybe. Uses unsafeCoerce to re-introduce type information implied by the EnvLabels.
-mkReindexPartial :: forall env env'. Map (Node GVal) (Node GVal) -> Env env -> Env env' -> ReindexPartial Maybe env env'
-mkReindexPartial m env env' idx = let node = lookupIdx idx env^._2 in case idxOf (inplaceOf node) env' of
+mkReindexPartial :: forall env env'. Map (Node GVal) (Node GVal) -> Env env -> Env env' -> ReindexPartial NeedsCopyMaybe env env'
+mkReindexPartial m env env' idx = NCM $ \c -> let node = lookupIdx idx env^._2 in Debug.Trace.trace (foo env' c) $ case idxOf (inplaceOf node) env' c of
     Just idx' -> Just idx'
     -- Note: we are not yet sure what happens if the variable after in-place updates is not found,
     -- but the variable before in-place updates is found. It might be that this never occurs.
@@ -1213,7 +1285,7 @@ mkReindexPartial m env env' idx = let node = lookupIdx idx env^._2 in case idxOf
     -- See https://github.com/ivogabe/accelerate/pull/11#discussion_r2424009960
     Nothing
       | inplaceOf node /= node
-      , Just _ <- (idxOf node env') ->
+      , Just _ <- (idxOf node env' c) ->
         internalError $ "mkReindexPartial: index of in-place updated buffer not found. Original buffer (without in-place updates taken into account) is available, but using that might not be sound."
       | otherwise -> Nothing
   where
@@ -1224,24 +1296,28 @@ mkReindexPartial m env env' idx = let node = lookupIdx idx env^._2 in case idxOf
     inplaceOf TupRunit = TupRunit
 
     -- Find the corresponding EnvLabel in the new environment.
-    idxOf :: forall e a. GroundVals a -> Env e -> Maybe (Idx e a)
-    idxOf bs ((_,bs',_) :>>: rest) -- bs' is the GroundVals in the new environment
-      -- Here we have to convince GHC that the top element in the environment
-      -- really does have the same type as the one we were searching for.
-      -- Some literature does this stuff too: 'effect handlers in haskell, evidently'
-      -- and 'a monadic framework for delimited continuations' come to mind.
-      -- Basically: standard procedure if you're using Ints as a unique identifier
-      -- and want to re-introduce type information. :)
-      -- Type applications allow us to restrict unsafeCoerce to the return type.
+
+    idxOf :: forall e a. GroundVals a -> Env e -> CopyId -> Maybe (Idx e a) 
+    idxOf bs ((_,bs', _, c') :>>: rest) c 
       | Just Refl <- matchGroundVals bs bs'
-      , bs == bs' = Just $ unsafeCoerce @(Idx e _) @(Idx e a) ZeroIdx
+      , c' == c
+      , bs == bs' = Debug.Trace.trace "found" $ Just ZeroIdx
       -- Recurse if we did not find e' yet.
-      | otherwise = SuccIdx <$> idxOf bs rest
+      | Just Refl <- matchGroundVals bs bs'
+      , bs == bs' = Debug.Trace.trace (show (c, c')) $ SuccIdx <$> idxOf bs rest c
+      | otherwise = SuccIdx <$> idxOf bs rest c
     -- If we hit the end, the Elabel was not present in the environment.
     -- That probably means we'll error out at a later point, but maybe there is
     -- a case where we try multiple options? No need to worry about it here.
-    idxOf _ EnvNil = Nothing
+    idxOf _ EnvNil _ = Nothing
 
+foo :: Env env -> CopyId -> String
+foo env c = "looking for " <> show c <> " in {" <> f env <> "}"
+  where
+    f :: forall env. Env env -> String
+    f EnvNil = ""
+    f ((_,_,_,c) :>>: (x :>>: env)) = show c <> "," <> f (x :>>: env)
+    f ((_,_,_,c) :>>: EnvNil) = show c
 
 --------------------------------------------------------------------------------
 -- Helpers
