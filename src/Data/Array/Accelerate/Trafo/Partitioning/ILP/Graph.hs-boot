@@ -8,3 +8,5 @@ type role Var nominal -- Needed, because it defaults to 'representational' here
 data Var (op :: Type -> Type)
 
 class MakesILP (op :: Type -> Type)
+
+mAXCOPIES :: Int

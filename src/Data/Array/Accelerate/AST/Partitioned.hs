@@ -80,7 +80,7 @@ type PartitionedAfun op = PreOpenAfun (Clustered op)
 data Clustered op args = Clustered (Cluster op args) (BackendCluster op args)
 
 data Cluster op args where
-  SingleOp :: SingleOp op args -> Node Comp -> Cluster op args
+  SingleOp :: SingleOp op args -> (Node Comp, CopyId) -> Cluster op args
   Fused :: Fusion largs rargs args
         -> Cluster op largs
         -> Cluster op rargs
@@ -426,13 +426,14 @@ addboth _ _ _ _ = error "fusing non-arrays"
 
 getElabelForSort :: LabelledArg env a -> Maybe (EnvLabel, CopyId)
 getElabelForSort (L (ArgArray m (ArrayR _ TupRsingle{}) _ _) (Arr (TupRsingle (C.Const e), _, _, TupRsingle (C.Const c)) _ _))
-  | In  <- m = Debug.Trace.trace ("in"  <> show c) $ Just (e, c)
-  | Out <- m = Debug.Trace.trace ("out" <> show c) $ Just (e, c)
+  | In  <- m = Just (e, c)
+  | Out <- m = Just (e, c)
+getElabelForSort (L ArgArray{} Arr{}) = error "not single"
 getElabelForSort _ = Nothing
 
 singleton
   :: MakesILP op
-  => Node Comp
+  => (Node Comp, CopyId)
   -> LabelledArgsOp op env args
   -> op args
   -> (forall args'. Clustered op args' -> LabelledArgsOp op env args' -> r)
@@ -504,13 +505,13 @@ createClusterArg _ sorted (LOp (ArgArray (m :: Modifier m) (ArrayR (shr :: Shape
     findLabel
       :: TupR ScalarType t
       -> EnvLabel
-      -> CopyId -- TODO: unsure
+      -> CopyId
       -> LabelledArgsOp op env sorted'
       -> Idx (FunToEnv sorted') (m sh t)
     findLabel tp label c = \case
-      LOp (ArgArray m' (ArrayR _ tp') sh' _) (Arr (TupRsingle (C.Const label'), _, _, c') _ _) _ :>: _
+      LOp (ArgArray m' (ArrayR _ tp') sh' _) (Arr (TupRsingle (C.Const label'), _, _, TupRsingle (C.Const c')) _ _) _ :>: _
         | label == label'
-        , TupRsingle (C.Const c) == c'
+        , c == c'
         , Refl <- expectOr "Modifier didn't match" $ matchModifier m m'
         , Refl <- expectOr "Shapes didn't match" $ matchVars sh sh'
         , Refl <- expectOr "Array types didn't match" $ matchTypeR tp tp'
@@ -617,12 +618,12 @@ expandUnitArg (LOp (ArgArray m (ArrayR shr (TupRpair t1 t2)) sh (TupRpair b1 b2)
 expandUnitArg arg@(LOp _ (Arr (TupRunit, _, _, _) _ _) _) = [Exists arg]
 expandUnitArg _ = []
 
-expandArg :: LabelledArgOp op env t -> [(EnvLabel, Exists (LabelledArgOp op env))]
+expandArg :: LabelledArgOp op env t -> [((EnvLabel, CopyId), Exists (LabelledArgOp op env))]
 expandArg (LOp (ArgArray m (ArrayR shr (TupRpair t1 t2)) sh (TupRpair b1 b2)) (Arr (TupRpair l1 l2, TupRpair bs1 bs2, TupRpair u1 u2, TupRpair c1 c2) shvar l) ba)
   =  expandArg (LOp (ArgArray m (ArrayR shr t1) sh b1) (Arr (l1, bs1, u1, c1) shvar l) ba)
   ++ expandArg (LOp (ArgArray m (ArrayR shr t2) sh b2) (Arr (l2, bs2, u2, c2) shvar l) ba)
-expandArg arg@(LOp _ (Arr (TupRsingle (C.Const l), _, _, _) _ _) _)
-  = [(l, Exists arg)]
+expandArg arg@(LOp _ (Arr (TupRsingle (C.Const l), _, _, TupRsingle (C.Const c)) _ _) _)
+  = [((l,c), Exists arg)]
 expandArg (LOp _ (Arr (TupRunit, _, _, _) _ _) _) = []
 expandArg _ = internalError "Tuple mismatch with labels"
 

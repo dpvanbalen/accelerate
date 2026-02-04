@@ -44,7 +44,7 @@ import qualified Data.Graph as G
 import qualified Data.Set as S
 import Data.Maybe (fromJust, fromMaybe)
 import Data.Type.Equality ( type (:~:)(Refl) )
-import Data.Array.Accelerate.Trafo.Partitioning.ILP.Solve (ClusterLs (Execs, NonExec), FusionGraphC (FusionGraphCopy), mAXCOPIES, ReadCopiesM)
+import Data.Array.Accelerate.Trafo.Partitioning.ILP.Solve (ClusterLs (Execs, NonExec), FusionGraphC (FusionGraphCopy), ReadCopiesM)
 import Data.Array.Accelerate.AST.Environment (weakenWithLHS)
 
 import Prelude hiding ( take )
@@ -217,7 +217,7 @@ openReconstruct' singletons labelenv graph clusterslist mlab subclustersmap symb
         SUse se  n be             -> Exists $ Use se n be
         SITE env' c t f   -> case (makeAST env (subcluster t), makeAST env (subcluster f)) of
           (Exists tacc, Exists facc) -> Exists $ tryBuildAcond
-            (fromJustNCM (reindexVar (mkReindexPartial' env' env) c) 0)
+            (fromJustNCM "ite" (reindexVar (mkReindexPartial' env' env) c) 0)
             tacc
             facc
         SWhl env' c b i u -> case (subcluster c, subcluster b) of
@@ -226,29 +226,35 @@ openReconstruct' singletons labelenv graph clusterslist mlab subclustersmap symb
               u
               cfun
               bfun
-              (fromJustNCM (reindexVars (mkReindexPartial' env' env) i) 0)
+              (fromJustNCM "whl" (reindexVars (mkReindexPartial' env' env) i) 0)
         SLet {} -> error "let without scope"
         SFun {} -> error "wrong type: function"
         SBod {} -> error "wrong type: function"
         SBlk {} -> error "wrong type: block"
-        SRet env' vars     -> Exists $ Return      (fromJustNCM (reindexVars (mkReindexPartial' env' env) vars) c) -- TODO: maybe all these c's should be 0?
-        SCmp env' expr     -> Exists $ Compute     (fromJustNCM (reindexExp  (mkReindexPartial' env' env) expr) c) -- are already duplicated somehow, but what id to give it?
-        SAlc env' shr e sh -> Exists $ Alloc shr e (fromJustNCM (reindexVars (mkReindexPartial' env' env) sh)   c)
-        SUnt env' evar     -> Exists $ Unit        (fromJustNCM (reindexVar  (mkReindexPartial' env' env) evar) c)
+        SRet env' vars     -> Exists $ Return      (fromJustNCM "ret" (reindexVars (mkReindexPartial' env' env) vars) c) -- these are already duplicated because they are inside of the let that gets duplicated
+        SCmp env' expr     -> Exists $ Compute     (fromJustNCM "cmp" (reindexExp  (mkReindexPartial' env' env) expr) c) -- they get the id of the let
+        SAlc env' shr e sh -> Exists $ Alloc shr e (fromJustNCM "alc" (reindexVars (mkReindexPartial' env' env) sh)   c)
+        SUnt env' evar     -> Exists $ Unit        (fromJustNCM "unt" (reindexVar  (mkReindexPartial' env' env) evar) c)
     makeAST env (cluster:ctail) =
       case makeCluster env cluster of
         NotFold (con, c)
           | SLet mylhs b u <- con -> 
-            case makeAST env [NonExecL (b, c)] of -- currently using the copyid of the let to assign copyid's to the allocs/computes. It works, but isn't neat
+            let copyidB = c
+                  -- this did not work for some reason
+                  -- case cluster of
+                  --   NonExecL (n, nc) -> snd readCopiesM !?? (n, if c == nc then c else error "?", b)
+                  --   _ -> error "?" 
+            in
+            case makeAST env [NonExecL (b, copyidB)] of -- currently using the copyid of the let to assign copyid's to the allocs/computes. It sometimes works? maybe this is what is going wrong now?
               Exists bnd -> case bnd of
                 Alloc{} -> 
                   case cluster of
-                    NonExecL n -> createLHS (copyLHS mylhs c) env $
+                    NonExecL n -> createLHS (copyLHS mylhs copyidB) env $
                       \env' lhs -> case makeAST env' ctail of
                         Exists scp -> Exists $ tryBuildAlet lhs u bnd scp
                 Compute{} -> 
                   case cluster of
-                    NonExecL n -> createLHS (copyLHS mylhs c) env $
+                    NonExecL n -> createLHS (copyLHS mylhs copyidB) env $
                       \env' lhs -> case makeAST env' ctail of
                         Exists scp -> Exists $ tryBuildAlet lhs u bnd scp
                 _ -> createLHS mylhs env $ \env' lhs ->
@@ -275,7 +281,7 @@ openReconstruct' singletons labelenv graph clusterslist mlab subclustersmap symb
     findTopOfF :: [ClusterL] -> (Node Comp, CopyId)
     findTopOfF [] = error "empty list"
     findTopOfF [NonExecL x] = x
-    findTopOfF (x@(NonExecL l):xs) = case symbols !?? fst l of
+    findTopOfF (x@(NonExecL l):xs) = case symbols !?? l of
       SBod _    -> findTopOfF xs
       SFun _ l' -> findTopOfF $ filter (\(NonExecL l'') -> fst l'' /= l') xs ++ [x]
       _ -> error "should be a function"
@@ -297,7 +303,7 @@ openReconstruct' singletons labelenv graph clusterslist mlab subclustersmap symb
     makeCluster :: HasCallStack => Env env -> ClusterL -> FoldType op env
     makeCluster env (ExecL ls) =
        foldr1 (flip fuseCluster)
-                    $ map ( \(l,c) -> case symbols !?? l of
+                    $ map ( \(l,c) -> case symbols !?? (l,c) of
                               SExe' env' args op ->
                                 -- First overwrite all array args (in particular the out args) to copyid 'c',
                                 -- then overwrite the input array args to the copyid they should have using readCopiesM
@@ -312,7 +318,7 @@ openReconstruct' singletons labelenv graph clusterslist mlab subclustersmap symb
 
                                 -- This particular NCM ignores the copy it gets for array arguments, due to a custom reindex
 
-                                    args''' = fromJustNCM (reindexLabelledArgsOpCopy (mkReindexPartial inplaceM env' env) args'') c
+                                    args''' = fromJustNCM "makecluster" (reindexLabelledArgsOpCopy (mkReindexPartial inplaceM env' env) args'') 0
                                 in
                                   if isNoOp op (unLabelOp args''') then
                                     -- Remove operations that became a no-op by in-place updates.
@@ -320,10 +326,10 @@ openReconstruct' singletons labelenv graph clusterslist mlab subclustersmap symb
                                     -- which is a no-op.
                                     EmptyFold
                                   else
-                                    InitFold op l args'''
+                                    InitFold op (l,c) args'''
                               _                 -> error "avoid this next refactor" -- c -> NotFold c
                           ) ls
-    makeCluster _ (NonExecL l) = NotFold $ first (symbols !??) l
+    makeCluster _ (NonExecL (l,c)) = NotFold (symbols !?? (l,c),c)
 
     fuseCluster :: FoldType op env -> FoldType op env -> FoldType op env
     fuseCluster EmptyFold f = f
@@ -342,7 +348,7 @@ weakenAcc lhs =  runIdentity . reindexAcc (weakenReindex $ weakenWithLHS lhs)
 
 data FoldType op env
   = forall args. Fold (Clustered op args) (LabelledArgsOp op env args)
-  | forall args. InitFold (op args) (Node Comp) (LabelledArgsOp op env args)
+  | forall args. InitFold (op args) (Node Comp, CopyId) (LabelledArgsOp op env args)
   | EmptyFold
   | NotFold (Symbol op, CopyId)
 
@@ -361,7 +367,7 @@ tryUpdateList p f (x : xs)
 
 consCluster :: forall env args extra op r
              . MakesILP op
-            => Node Comp
+            => (Node Comp, CopyId)
             -> LabelledArgsOp op env extra
             -> op extra
             -> LabelledArgsOp op env args
@@ -449,7 +455,7 @@ tryBuildAwhile u c@(Alam lhsCond (Abody cond)) s@(Alam lhsStep (Abody step)) ini
 tryBuildAwhile _ _ _ _ = internalError "Cannot reconstruct Awhile: condition or step has invalid type"
 
 changeReadCopiesArgs :: LabelledArgsOp op env args -> ReadCopiesM -> Node Comp -> CopyId -> LabelledArgsOp op env args
-changeReadCopiesArgs args rcm l c = go args
+changeReadCopiesArgs args (rcm,_) l c = go args
   where
     go :: LabelledArgsOp op env args -> LabelledArgsOp op env args
     go ArgsNil = ArgsNil

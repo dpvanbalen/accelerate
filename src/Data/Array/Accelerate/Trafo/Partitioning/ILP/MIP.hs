@@ -38,7 +38,7 @@ import Data.Text (unpack)
 
 import Debug.Trace (traceShowId)
 
-debugging = True
+debugging = False
 
 
 newtype MIP s = MIP s

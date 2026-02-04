@@ -61,8 +61,8 @@ encodeModifier Out = intHost $(hashQ "Out")
 encodeModifier Mut = intHost $(hashQ "Mut")
 
 encodeCluster :: EncodeOperation op => Cluster op args -> Builder
-encodeCluster (SingleOp op label)
-  = intHost $(hashQ "SingleOp") <> encodeSingleOp op <> encodeLabel label
+encodeCluster (SingleOp op (label,c))
+  = intHost $(hashQ "SingleOp") <> encodeSingleOp op <> encodeLabel label <> intHost c
 encodeCluster (Fused fusion left right)
   = intHost $(hashQ "Fused") <> encodeFusion fusion <> encodeCluster left <> encodeCluster right
 

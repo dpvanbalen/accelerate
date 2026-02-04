@@ -60,7 +60,8 @@ import Data.Kind (Type)
 import Debug.Trace
 import Unsafe.Coerce (unsafeCoerce)
 
-
+mAXCOPIES :: Int
+mAXCOPIES = 2
 
 --------------------------------------------------------------------------------
 -- Fusion Graph
@@ -421,7 +422,7 @@ class ( ShrinkArg (BackendClusterArg op), Eq (BackendVar op)
 
   -- | Given an ILP solution, attach the backend-specific information to an
   --   argument.
-  labelLabelledArg :: Solution op -> Node Comp -> LabelledArg env a -> LabelledArgOp op env a
+  labelLabelledArg :: Solution op -> Node Comp -> CopyId -> LabelledArg env a -> LabelledArgOp op env a
 
   -- | Convert a labelled argument to a cluster argument.
   getClusterArg :: LabelledArgOp op env a -> BackendClusterArg op a
@@ -444,9 +445,9 @@ class ( ShrinkArg (BackendClusterArg op), Eq (BackendVar op)
   finalize :: FusionGraph -> Constraint op
 
 -- | Attach backend-specific information to labelled arguments.
-labelLabelledArgs :: MakesILP op => Solution op -> Node Comp -> LabelledArgs env args -> LabelledArgsOp op env args
-labelLabelledArgs sol l (arg :>: args) = labelLabelledArg sol l arg :>: labelLabelledArgs sol l args
-labelLabelledArgs _ _ ArgsNil = ArgsNil
+labelLabelledArgs :: MakesILP op => Solution op -> Node Comp -> CopyId -> LabelledArgs env args -> LabelledArgsOp op env args
+labelLabelledArgs sol l c (arg :>: args) = labelLabelledArg sol l c arg :>: labelLabelledArgs sol l c args
+labelLabelledArgs _ _ _ ArgsNil = ArgsNil
 
 --------------------------------------------------------------------------------
 -- ILP Variables
@@ -587,7 +588,7 @@ instance Show (Symbol op) where
   show (SUnt {}) = "Unt"
 
 -- | Mapping from labels to symbols.
-type Symbols op = Map (Node Comp) (Symbol op)
+type Symbols op = Map (Node Comp, CopyId) (Symbol op)
 
 data LabelledArgOp  op env a = LOp (Arg env a) (ArgLabel a) (BackendArg op)
 type LabelledArgsOp op env   = PreArgs (LabelledArgOp op env)
@@ -630,10 +631,11 @@ reindexLabelledArgsOpCopy :: ReindexPartial NeedsCopyMaybe env env' -> LabelledA
 reindexLabelledArgsOpCopy = reindexPreArgsNCM reindexLabelledArgOpCopy
 
 attachBackendLabels :: MakesILP op => Solution op -> Symbols op -> Symbols op
-attachBackendLabels sol = M.mapWithKey \cases
-  l (SExe env largs op) -> SExe' env (labelLabelledArgs sol l largs) op
+attachBackendLabels sol = M.foldMapWithKey \cases
+  (l,0) (SExe env largs op) -> foldMap (\c -> M.singleton (l,c) (SExe' env (labelLabelledArgs sol l c largs) op)) [0.. mAXCOPIES]
   _  SExe'{} -> internalError "already converted???"
-  _  con -> con
+  (l,0) con -> foldMap (\c -> M.singleton (l,c) con) [0..mAXCOPIES]
+  _ _ -> internalError "not 0?"
 
 copyLabelledArgsOp :: LabelledArgsOp op env args -> CopyId -> LabelledArgsOp op env args
 copyLabelledArgsOp (arg :>: args) c = copyLabelledArgOp arg c :>: copyLabelledArgsOp args c
@@ -707,6 +709,7 @@ addtolookupenv n (L arg (Arr (_,arr,_,_) _ l) :>: args) = case arg of
     writers <- use writersEnv >>= (\m -> pure . S.unions $ S.map (Data.Maybe.fromJust . (m M.!?)) gvals)
     mapM_ (\w -> lookupEnv %= M.insert (w, n) l) writers
     addtolookupenv n args
+  -- todo: out arguments still need to know where to write to?
   _ -> addtolookupenv n args
 addtolookupenv n (_ :>: args) = addtolookupenv n args
 
@@ -808,7 +811,7 @@ allReaders :: (Foldable f, HasReadersEnv s) => f (Node GVal) -> SimpleGetter s (
 allReaders bs = to (\s -> foldMap (\b -> s^.readers b) bs)
 
 -- | Lens for getting and setting symbol of a computation.
-symbol :: HasSymbols s op => Node Comp -> Lens' s (Maybe (Symbol op))
+symbol :: HasSymbols s op => (Node Comp, CopyId) -> Lens' s (Maybe (Symbol op))
 symbol c = symbols.(`M.alterF` c)
 
 -- | Lens for getting and setting the allocator of a buffer. 'symbol' but for
@@ -891,6 +894,11 @@ writesBuffers c = traverse_ \b -> do
   fusionILP %= ws >=|-|=> c
   writers b .= S.singleton c
   readers b .= S.empty
+  -- as <- use $ allocator b
+  -- each copy of a combinator writes to the corresponding allocated buffer
+  mapM_ (\copyid -> mapM_ (\w -> 
+      fusionILP.constraints %= (<> readCopy w copyid c copyid .==. int 0)
+    ) ws) [0..mAXCOPIES]
 
 -- | Mutate a buffer.
 --
@@ -999,23 +1007,25 @@ mkFusionGraph (Exec op args) = do
   c `mutatesBuffers` (inpArrs `S.intersection` outArrs)
   c `requiresBuffers` notArrs
   zoom (backendGraphState renv wenv) (mkGraph c op labelledArgs)
-  symbol c ?= SExe env labelledArgs op
+  symbol (c,0) ?= SExe env labelledArgs op
   return TupRunit
 
 mkFusionGraph (Alet LeftHandSideUnit _ bnd body)
   = mkFusionGraph bnd >> mkFusionGraph body
 
--- In this definition I assume that whatever the right-hand side returns is
+-- In this definition I assume that whatever the left-hand side returns is
 -- produced by a single computation, which is currently true because all
 -- instructions attach themselves to the buffer.
 mkFusionGraph (Alet lhs u bnd body) = do
-  c       <- freshComp  -- TODO: If there is an issue with reconstruction, maybe move this behind "bndRes <- mkFusionGraph bnd". The order in which labels are generate affects the order in which the clusters are interpreted. Previously let-bindings where always in a separate cluster from the bound computation, but now they are usually in the same cluster to prevent all buffers from being manifest. That said, topsort should already be taking care of this ordering issue.
+  -- TODO: If there is an issue with reconstruction, maybe move this behind "bndRes <- mkFusionGraph bnd". The order in which labels are generate affects the order in which the clusters are interpreted. Previously let-bindings where always in a separate cluster from the bound computation, but now they are usually in the same cluster to prevent all buffers from being manifest. That said, topsort should already be taking care of this ordering issue.
+  -- update: I'm pretty sure the order doesn't matter?
+  c       <- freshComp  
   env     <- use environment
   bndRes  <- mkFusionGraph bnd
   bndResW <- foldMapMTupR (use . allWriters . valNodes) bndRes
   c `bindsBuffers` valsNodes bndRes
   env'    <- zoom currEnvL (weakenEnv lhs bndRes u env)
-  symbol c ?= SLet (bindLHS lhs env') (fromSingletonSet bndResW) u
+  symbol (c,0) ?= SLet (bindLHS lhs env') (fromSingletonSet bndResW) u
   zoom (local env') (mkFusionGraph body)
 
 mkFusionGraph (Return vars) = do
@@ -1023,7 +1033,7 @@ mkFusionGraph (Return vars) = do
   retN <- freshComp
   let (_, bs, _, _) = lookupVars vars env
   retN `returnsBuffers` valsNodes bs
-  symbol retN ?= SRet env vars
+  symbol (retN,0) ?= SRet env vars
   return bs
 
 mkFusionGraph (Manifest buff) = do
@@ -1031,33 +1041,33 @@ mkFusionGraph (Manifest buff) = do
   retN <- freshComp
   let (_, bs, _, _) = lookupVar buff env
   retN `returnsBuffers` valsNodes bs
-  symbol retN ?= SRet env (TupRsingle buff)
+  symbol (retN,0) ?= SRet env (TupRsingle buff)
   return bs
 
 mkFusionGraph (Compute expr) = do
   c    <- freshComp
   env  <- use environment
   c `requiresBuffers` getExpDeps expr env
-  symbol c ?= SCmp env expr
+  symbol (c,0) ?= SCmp env expr
   freshVals c (groundsR expr)
 
 mkFusionGraph (Alloc shr e sh) = do
   c <- freshComp
   env   <- use environment
   c `requiresBuffers` getVarsDeps sh env
-  symbol c ?= SAlc env shr e sh
+  symbol (c,0) ?= SAlc env shr e sh
   TupRsingle <$> freshVal c (GroundRbuffer e)
 
 mkFusionGraph (Unit v) = do
   c    <- freshComp
   env <- use environment
   c `requiresBuffers` getVarDeps v env
-  symbol c ?= SUnt env v
+  symbol (c,0) ?= SUnt env v
   TupRsingle <$> freshVal c (GroundRbuffer $ varType v)
 
 mkFusionGraph (Use tp n buff) = do
   c <- freshComp
-  symbol c ?= SUse tp n buff
+  symbol (c,0) ?= SUse tp n buff
   TupRsingle <$> freshVal c (GroundRbuffer tp)
 
 mkFusionGraph (Acond cond tacc facc) = do
@@ -1066,7 +1076,7 @@ mkFusionGraph (Acond cond tacc facc) = do
   zoom (scope condN) do
     trueN  <- freshComp
     falseN <- freshComp
-    symbol condN ?= SITE env cond trueN falseN
+    symbol (condN,0) ?= SITE env cond trueN falseN
     condN `requiresBuffers` getVarDeps cond env  -- If-then-else reads the condition variable,
     res <- uncurry (<>) <$> branches             -- executes "both" branches, and
       (block trueN  $ mkFusionGraph tacc)
@@ -1086,7 +1096,7 @@ mkFusionGraph (Awhile u cond body init) = do
     _ <- branches                                 -- executes "both" the condition and body,
       (block condN $ mkFusionGraphU u cond)
       (block bodyN $ mkFusionGraphU u body)
-    symbol whileN ?= SWhl env condN bodyN init u
+    symbol (whileN,0) ?= SWhl env condN bodyN init u
   return res                                      -- to return a fresh value of the same type as the initial value.
 
 
@@ -1102,7 +1112,7 @@ mkFusionGraphU u (Alam lhs f) = do
   args <- freshVals lam (lhsToTupR lhs)
   env' <- zoom currEnvL (weakenEnv lhs args u env)
   fun  <- zoom (local env') (mkFusionGraphF f)
-  symbol lam ?= SFun (bindLHS lhs env') fun
+  symbol (lam,0) ?= SFun (bindLHS lhs env') fun
   return lam
 
 
@@ -1116,7 +1126,7 @@ mkFusionGraphF (Abody acc) = do
   bodyN <- freshComp
   zoom (scope bodyN) do
     res <- mkFusionGraph acc
-    symbol bodyN ?= SBod res
+    symbol (bodyN,0) ?= SBod res
     id %= makeManifest (valsNodes res)
     bodyN `returnsBuffers` valsNodes res
     return bodyN
@@ -1128,7 +1138,7 @@ mkFusionGraphF (Abody acc) = do
 --   The 'SBlk' symbol isn't even needed, because any time we encounter it an
 --   error is thrown, but it is somewhat useful for debugging.
 block :: Node Comp -> State (FusionGraphState op env) r -> State (FusionGraphState op env) r
-block c f = zoom (scope c) $ symbol c ?= SBlk >> f
+block c f = zoom (scope c) $ symbol (c,0) ?= SBlk >> f
 
 
 
@@ -1190,7 +1200,7 @@ filterInplacePaths g = g&fusionILP.inplacePaths %~ filterKeys sameElementType
 
     -- Gets the element size of a buffer.
     getElt :: Node GVal -> Exists TypeR
-    getElt b = case (g^.allocator b) >>= (\c -> g^.symbol c) of
+    getElt b = case (g^.allocator b) >>= (\c -> g^.symbol (c,0)) of
       Just (SAlc _ _ e _)      -> Exists $ TupRsingle e
       Just (SUnt _ v)          -> Exists $ TupRsingle $ varType v
       Just (SUse e _ _)        -> Exists $ TupRsingle e
@@ -1225,6 +1235,7 @@ finalizeInplacePaths = filterInplacePaths . mkInplacePathsFromClusters
 -- This approach should be able to find many more in-place update paths than
 -- just combining the in-place paths of length 1, because it considers
 -- computations that are not directly connected by an in-place path.
+-- TODO: see if workdup should change some of this
 mkInplacePathsFromClusters :: forall op. MakesILP op => FullGraph op -> FullGraph op
 mkInplacePathsFromClusters g = g&fusionILP.inplacePaths <>~ go initialClusters
   where
@@ -1246,7 +1257,7 @@ mkInplacePathsFromClusters g = g&fusionILP.inplacePaths <>~ go initialClusters
     nextMap = foldl (flip \(c1,_,c2) -> M.insertWith (<>) c1 (S.singleton c2)) M.empty (g^.fusionILP.fusibleEdges)
 
     clusterInplacePaths :: Node Comp -> Node Comp -> Map InplacePath Number
-    clusterInplacePaths cIn cOut = case (g^.symbol cIn, g^.symbol cOut) of
+    clusterInplacePaths cIn cOut = case (g^.symbol (cIn,0), g^.symbol (cOut,0)) of
       (Just (SExe _ largsIn _), Just (SExe _ largsOut _)) ->
         foldMapInputLabels (\lIn -> foldMapOutputLabels (mkInplacePaths 1 cIn cOut lIn) largsOut) largsIn
       _ -> mempty
@@ -1263,17 +1274,17 @@ instance Applicative NeedsCopyMaybe where
   pure = NCM . const . Just
   (NCM a) <*> (NCM b) = NCM $ \c -> a c <*> b c 
 
-fromJustNCM :: NeedsCopyMaybe a -> CopyId -> a
-fromJustNCM (NCM f) c = case f c of
+fromJustNCM :: String -> NeedsCopyMaybe a -> CopyId -> a
+fromJustNCM s (NCM f) c = case f c of
   Just x -> x
-  Nothing -> error $ show c
+  Nothing -> error $ s <> show c 
 
 
 -- | Makes a ReindexPartial, which allows us to transform indices in @env@ into indices in @env'@.
 -- We cannot guarantee the index is present in env', so we use the partiality of ReindexPartial by
 -- returning a Maybe. Uses unsafeCoerce to re-introduce type information implied by the EnvLabels.
 mkReindexPartial :: forall env env'. Map (Node GVal) (Node GVal) -> Env env -> Env env' -> ReindexPartial NeedsCopyMaybe env env'
-mkReindexPartial m env env' idx = NCM $ \c -> let node = lookupIdx idx env^._2 in Debug.Trace.trace (foo env' c) $ case idxOf (inplaceOf node) env' c of
+mkReindexPartial m env env' idx = NCM $ \c -> let node = lookupIdx idx env^._2 in {- Debug.Trace.trace (foo env' c) $ -} case idxOf (inplaceOf node) env' c of
     Just idx' -> Just idx'
     -- Note: we are not yet sure what happens if the variable after in-place updates is not found,
     -- but the variable before in-place updates is found. It might be that this never occurs.
@@ -1301,15 +1312,15 @@ mkReindexPartial m env env' idx = NCM $ \c -> let node = lookupIdx idx env^._2 i
     idxOf bs ((_,bs', _, c') :>>: rest) c 
       | Just Refl <- matchGroundVals bs bs'
       , c' == c
-      , bs == bs' = Debug.Trace.trace "found" $ Just ZeroIdx
+      , bs == bs' = Just ZeroIdx
       -- Recurse if we did not find e' yet.
       | Just Refl <- matchGroundVals bs bs'
-      , bs == bs' = Debug.Trace.trace (show (c, c')) $ SuccIdx <$> idxOf bs rest c
-      | otherwise = SuccIdx <$> idxOf bs rest c
+      , bs == bs' = {- Debug.Trace.trace (show (c, c')) $ -} SuccIdx <$> idxOf bs rest c
+      | otherwise = {- Debug.Trace.trace "next"         $ -} SuccIdx <$> idxOf bs rest c
     -- If we hit the end, the Elabel was not present in the environment.
     -- That probably means we'll error out at a later point, but maybe there is
     -- a case where we try multiple options? No need to worry about it here.
-    idxOf _ EnvNil _ = Nothing
+    idxOf _ EnvNil _ = Debug.Trace.trace "end" Nothing
 
 foo :: Env env -> CopyId -> String
 foo env c = "looking for " <> show c <> " in {" <> f env <> "}"
@@ -1369,13 +1380,14 @@ filterKeys p = M.filterWithKey (\k _ -> p k)
 
 -- | Converts a graph to a DOT representation.
 toDOT :: FusionGraph -> Symbols op -> String
-toDOT g syms = "strict digraph {\n" ++
-  concatMap (\c -> "  <" ++ show c ++ "> [shape=box, label=\"" ++ show (syms M.! c) ++ tail (show c) ++ "\"];\n") (g^.computationNodes) ++
-  concatMap (\b -> "  <" ++ show b ++ "> [shape=ellipse, label=\"" ++ show b ++ "\"];\n") (g^.valueNodes) ++
-  concatMap (\(b,c) -> "  <" ++ show b ++ "> -> <" ++ show c ++ "> [];\n") (g^.readEdges) ++
-  concatMap (\(c,b) -> "  <" ++ show c ++ "> -> <" ++ show b ++ "> [];\n") (g^.writeEdges) ++
-  concatMap (\((b1, _), (_, b2)) -> "  <" ++ show b1 ++ "> -> <" ++ show b2 ++ "> [color=gray, style=dotted];\n") (M.keysSet $ g^.inplacePaths) ++
-  concatMap (\(c1,_,c2) -> "  <" ++ show c1 ++ "> -> <" ++ show c2 ++ "> [color=green];\n") (g^.fusibleEdges) ++
-  concatMap (\(c1,_,c2) -> "  <" ++ show c1 ++ "> -> <" ++ show c2 ++ "> [color=red];\n") (g^.infusibleEdges) ++
-  concatMap (\(c1,c2) -> "  <" ++ show c1 ++ "> -> <" ++ show c2 ++ "> [style=dashed, color=red];\n") (g^.orderEdges) ++
-  "}\n"
+toDOT g syms = undefined
+-- "strict digraph {\n" ++
+--   concatMap (\c -> "  <" ++ show c ++ "> [shape=box, label=\"" ++ show (syms M.! c) ++ tail (show c) ++ "\"];\n") (g^.computationNodes) ++
+--   concatMap (\b -> "  <" ++ show b ++ "> [shape=ellipse, label=\"" ++ show b ++ "\"];\n") (g^.valueNodes) ++
+--   concatMap (\(b,c) -> "  <" ++ show b ++ "> -> <" ++ show c ++ "> [];\n") (g^.readEdges) ++
+--   concatMap (\(c,b) -> "  <" ++ show c ++ "> -> <" ++ show b ++ "> [];\n") (g^.writeEdges) ++
+--   concatMap (\((b1, _), (_, b2)) -> "  <" ++ show b1 ++ "> -> <" ++ show b2 ++ "> [color=gray, style=dotted];\n") (M.keysSet $ g^.inplacePaths) ++
+--   concatMap (\(c1,_,c2) -> "  <" ++ show c1 ++ "> -> <" ++ show c2 ++ "> [color=green];\n") (g^.fusibleEdges) ++
+--   concatMap (\(c1,_,c2) -> "  <" ++ show c1 ++ "> -> <" ++ show c2 ++ "> [color=red];\n") (g^.infusibleEdges) ++
+--   concatMap (\(c1,c2) -> "  <" ++ show c1 ++ "> -> <" ++ show c2 ++ "> [style=dashed, color=red];\n") (g^.orderEdges) ++
+--   "}\n"

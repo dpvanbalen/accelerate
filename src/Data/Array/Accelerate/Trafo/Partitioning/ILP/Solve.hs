@@ -34,7 +34,6 @@ import Data.Foldable
 import qualified Debug.Trace
 
 
-mAXCOPIES = 2
 
 data Objective
   -- Old fusion only objectives:
@@ -360,13 +359,13 @@ interpretReadDirs = M.fromList . mapMaybe (_1 fromReadDir) . M.toList
 --     fromWriteDir (WriteDir c b 0) = Just (c, b)
 --     fromWriteDir _              = Nothing
 
-type ReadCopiesM = M.Map (Node Comp, CopyId, ArgL) CopyId
+type ReadCopiesM = (M.Map (Node Comp, CopyId, ArgL) CopyId, M.Map (Node Comp, CopyId, Node Comp) CopyId)
 interpretReadCopies :: Solution op -> LookupEnv -> ReadCopiesM
-interpretReadCopies sol env = foldr f M.empty . M.toList $ sol
+interpretReadCopies sol env = foldr f (M.empty, M.empty) . M.toList $ sol
   where
-    f (ReadCopy s cs n cn, 0) m = case (env M.!? (s,n)) of 
-        Just al -> M.insert (n, cn, al) cs m
-        Nothing -> m
+    f (ReadCopy s cs n cn, 0) (ma,mn) = case (env M.!? (s,n)) of 
+        Just al -> (M.insert (n, cn, al) cs ma, M.insert (n, cn, s) cs mn)
+        Nothing -> {- Debug.Trace.trace ("not in env: " <> show (s,cs,n,cn)) -} (ma, M.insert (n, cn, s) cs mn)
     f _ m = m
 
 -- | Extract the top-level clusters and the sub-scoped clusters from the ILP
@@ -426,8 +425,9 @@ data FusionGraphC = FusionGraphCopy
   }
 
 fusionGraphC :: MakesILP op => Solution op -> FusionGraph -> FusionGraphC
-fusionGraphC sol (FusionGraph nodes _ strict dataflow _) = (\x@(FusionGraphCopy nc sc dc) -> Debug.Trace.trace (sz nodes <> " " <> sz nc <> " " <> sz strict <> " " <> sz sc <> " " <> sz dataflow <> " " <> sz dc) x) $
+fusionGraphC sol (FusionGraph nodes _ strict dataflow _) =
   FusionGraphCopy 
+    -- only pi nodes, and only those that are in use
     (S.unions $ S.map (\n -> S.map (\(Pi m c) -> (m,c)) $ flip S.filter (M.keysSet sol) \case
       Pi m c -> m == n && sol M.! UseCopy m c == 0
       _ -> False
@@ -449,9 +449,9 @@ splitExecs :: ([S.Set (Node Comp, CopyId)], M.Map (Node Comp) [S.Set (Node Comp,
 splitExecs (xs, xM) symbolM = (f xs, M.map f xM)
   where
     f :: [S.Set (Node Comp, CopyId)] -> [ClusterLs]
-    f = concatMap (\ls -> filter (/= Execs mempty) $ map NonExec (S.toList $ S.filter (isBeforeExec . fst) ls) ++ [Execs (S.filter (isExec . fst) ls)] ++ afterexecs ls)
+    f = concatMap (\ls -> filter (/= Execs mempty) $ map NonExec (S.toList $ S.filter isBeforeExec ls) ++ [Execs (S.filter isExec ls)] ++ afterexecs ls)
 
-    isExec :: Node Comp -> Bool
+    isExec :: (Node Comp, CopyId) -> Bool
     isExec l = case symbolM M.!? l of
       Just SExe {} -> True
       Just SExe'{} -> True
@@ -468,7 +468,7 @@ splitExecs (xs, xM) symbolM = (f xs, M.map f xM)
     -- Tests say that this happens, and that it's correct anyway, but I'm unsure why.
     -- The reason I doubt is because if multiple non-exec, non-lhs nodes are here, the current reconstruction code
     -- (I think) ignores all but the last one.
-    afterexecs ls = let xs = map NonExec (S.toList $ S.filter (isAfterExec . fst) ls) in if length xs > 1 then xs {-error "dunno what this means"-} else xs
+    afterexecs ls = let xs = map NonExec (S.toList $ S.filter isAfterExec ls) in if length xs > 1 then xs {-error "dunno what this means"-} else xs
 
 -- Only needs Applicative
 newtype MonadMonoid f m = MonadMonoid { getMonadMonoid :: f m }
